@@ -1,0 +1,10 @@
+{
+  "_nota": "Copia este fichero a .claude/orquestacion.json en la raíz de TU repositorio. `fuera`: agente → motivo. `reasignado`: número de issue → quién la tomó. La actividad se deduce de git; aquí sólo va lo que git no puede saber.",
+  "fuera": {
+    "codex": "sin cuota de tokens desde el 07-10"
+  },
+  "reasignado": {
+    "344": "claude",
+    "314": "claude"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "consumo",
+  "version": "0.4.2",
+  "description": "Tablero de consumo y avance real: cuántas issues del repositorio se cerraron con el consumo del proyecto y qué parte de la factura mensual se lleva; la orquestación (qué agentes trabajan en el repositorio, cuál quedó fuera y qué hay que redistribuir); y de la sesión: contexto, presupuesto, ritmo de gasto, tarea en curso, bucle, pendientes en GitHub, costo por modelo y por tarea, y cobertura de pruebas.",
+  "author": {
+    "name": "Agents Learning Loops"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "facturaMensualUsd": {
+      "type": "number",
+      "title": "Factura mensual (USD)",
+      "description": "Lo que pagas al mes; el tablero la reparte entre los proyectos de esta máquina según su consumo y dice cuánto se lleva éste.",
+      "default": 238
+    },
+    "presupuestoUsd": {
+      "type": "number",
+      "title": "Presupuesto de la sesión (USD)",
+      "description": "Presupuesto de la sesión en USD; el tablero muestra cuánto va gastado y la autonomía al ritmo actual.",
+      "default": 200
+    },
+    "repo": {
+      "type": "string",
+      "title": "Repositorio de GitHub",
+      "description": "Repositorio (dueño/nombre) del que se leen las issues y los PR. Vacío: se toma del remoto origin del proyecto.",
+      "default": ""
+    },
+    "cuentaGitHub": {
+      "type": "string",
+      "title": "Cuenta de gh",
+      "description": "Cuenta de gh con la que se consulta (gh auth token --user <cuenta>). Vacío: la cuenta dueña del repositorio.",
+      "default": ""
+    }
+  }
+}

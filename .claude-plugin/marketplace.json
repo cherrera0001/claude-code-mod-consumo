@@ -1,0 +1,5 @@
+{
+  "name": "consumo-local",
+  "owner": { "name": "local" },
+  "plugins": [{ "name": "consumo", "source": "./" }]
+}
