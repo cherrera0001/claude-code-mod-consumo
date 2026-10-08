@@ -1,7 +1,7 @@
 {
   "name": "consumo",
-  "version": "0.4.2",
-  "description": "Tablero de consumo y avance real: cuántas issues del repositorio se cerraron con el consumo del proyecto y qué parte de la factura mensual se lleva; la orquestación (qué agentes trabajan en el repositorio, cuál quedó fuera y qué hay que redistribuir); y de la sesión: contexto, presupuesto, ritmo de gasto, tarea en curso, bucle, pendientes en GitHub, costo por modelo y por tarea, y cobertura de pruebas.",
+  "version": "2.0.0",
+  "description": "Mide, gestiona y controla el trabajo. Mide la sesión (presupuesto, contexto, ritmo), las issues cerradas contra la factura, GitHub y la cobertura. Gestiona la cola y quién tiene cada issue. Controla: en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y escribe la decisión en .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece.",
   "author": {
     "name": "Agents Learning Loops"
   },

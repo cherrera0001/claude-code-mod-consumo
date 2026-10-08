@@ -12,7 +12,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await pane.find({ text: /Presupuesto 200 USD/ })).toBeDefined()
     expect(await pane.find({ text: /Autonomía/ })).toBeDefined()
     expect(await pane.find({ text: /Avance real/ })).toBeDefined()
-    expect(await pane.find({ text: /Ahora/ })).toBeDefined()
+    expect(await pane.find({ text: /3 · ¿Quién tiene cada issue/ })).toBeDefined()
     expect(await pane.find({ text: /Pendiente en GitHub/ })).toBeDefined()
     expect(await pane.find({ text: /Cobertura de pruebas/ })).toBeDefined()
     expect(await pane.find({ type: 'Button', text: /Actualizar/ })).toBeDefined()
@@ -88,48 +88,87 @@ test('con una medición, el avance real muestra cierres, factura y la semana sin
   expect(await pane.find({ text: /73 despertares del bucle, 32 sin cambios/ })).toBeDefined()
 })
 
-// La orquestación se ve: quién trabaja, quién quedó fuera y qué hay que redistribuir.
-test('la orquestación muestra agentes externos, el que quedó fuera y lo que hay que redistribuir', async ($, on) => {
-  const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[] }) => unknown) => void
-  const estado = {
-    ahora: 1_780_000_000,
-    agentes: [
-      { nombre: 'agy', issue: 345, rama: 'agy/345', commits: 3, sin_confirmar: 0, ultima: 1_779_999_900, con_arbol: true, estado: 'activo', motivo: '', hace_min: 1.5, reasignado_a: '' },
-      { nombre: 'codex', issue: 344, rama: 'codex/344', commits: 5, sin_confirmar: 0, ultima: 1_779_990_000, con_arbol: true, estado: 'fuera', motivo: 'sin cuota', hace_min: 166, reasignado_a: 'claude' },
-      { nombre: 'codex', issue: 314, rama: 'codex/314', commits: 0, sin_confirmar: 5, ultima: 1_779_995_000, con_arbol: true, estado: 'fuera', motivo: 'sin cuota', hace_min: 83, reasignado_a: '' },
-    ],
-    externos: 2,
-    externos_activos: 1,
-    subagentes: { total: 8, activos: 1, ultimos: [{ etiqueta: 'QA CONTRA de #333', hace_min: 0.3, activo: true }] },
-    por_redistribuir: [314],
-  }
+// ── El control ──────────────────────────────────────────────────────────────────────────────────────
+// «/consumo agentes» ejecuta el control por su camino real. Lo que el motor de pruebas no trae lo contesta
+// la prueba: el disco (.claude/orquestacion.json), git y el envoltorio de GitHub del repositorio.
+type IssueDePrueba = { number: number; title: string; labels: { name: string }[]; body: string; projectItems: unknown[] }
+
+function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Record<string, unknown>): { escrito: () => any } {
+  const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string }) => unknown) => void
+  let guardado = JSON.stringify(estado)
   contestar('ui.open', () => ({ value: undefined }))
   contestar('clock.now', () => ({ value: 1_780_000_000_000 }))
   contestar('session.id', () => ({ value: 'sesion' }))
   contestar('session.cwd', () => ({ value: 'F:/proyecto' }))
   contestar('session.root', () => ({ value: 'F:/proyecto' }))
-  contestar('fs.exists', () => ({ value: false }))
-  contestar('process.run', (_$, e) =>
-    (e.argv ?? []).includes('--raiz') && !(e.argv ?? []).includes('--factura')
-      ? { value: { exitCode: 0, stdout: JSON.stringify(estado), stderr: '' } }
-      : { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } },
-  )
-  const respuesta = await $.command.run({ command: 'consumo', args: 'agentes' } as never)
-  expect(JSON.stringify(respuesta)).toContain('2 agentes externos (1 activos, fuera: codex)')
-  expect(JSON.stringify(respuesta)).toContain('por redistribuir: #314')
-  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
-  expect(await pane.find({ text: /Orquestación · 2 agentes externos \(1 activos\) · 8 subagentes de la sesión/ })).toBeDefined()
-  expect(await pane.find({ text: /agy\s+#345 · 3 commits/ })).toBeDefined()
-  expect(await pane.find({ text: /codex\s+#344 · 5 commits.*sin cuota.*reasignada a claude/ })).toBeDefined()
-  expect(await pane.find({ text: /Por redistribuir: #314/ })).toBeDefined()
-  expect(await pane.find({ text: /subagente «QA CONTRA de #333» · trabajando/ })).toBeDefined()
+  contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
+  contestar('fs.exists', (_$, e) => ({ value: /orquestacion\.json$/.test(String(e.path)) }))
+  contestar('fs.read', () => ({ value: guardado }))
+  contestar('fs.write', (_$, e) => {
+    guardado = String(e.text)
+    return { value: undefined }
+  })
+  contestar('process.run', (_$, e) => {
+    const argv = e.argv ?? []
+    if (argv.some(a => a.endsWith('gh-vt.ps1')) && argv.includes('list')) return { value: { exitCode: 0, stdout: JSON.stringify(issues), stderr: '' } }
+    if (argv[0] === 'git' && argv.includes('remote')) return { value: { exitCode: 0, stdout: 'https://github.com/acme/plataforma.git', stderr: '' } }
+    if (argv[0] === 'git' && argv.includes('log') && argv.includes('main')) return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    return { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } }
+  })
+  return { escrito: () => JSON.parse(guardado) }
+}
+
+const issue = (number: number, title: string, etiquetas: string[] = [], body = ''): IssueDePrueba => ({ number, title, labels: etiquetas.map(name => ({ name })), body, projectItems: [{}] })
+
+test('una Decisión no sale asignada: queda «espera al dueño» y el control sigue con la siguiente', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(325, 'Qué alcance tiene el observador', ['decision-humana']), issue(346, 'Ajustar un formulario')], { cola: [325, 346] })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('Espera al dueño: #325')
+  expect(respuesta).toContain('Esta sesión tiene la #346')
+  expect(repo.escrito().asignaciones['325']).toBeUndefined()
+  expect(repo.escrito().asignaciones['346'].trabajador).toBe('claude')
 })
 
-// Sin ramas de agentes, la sección lo dice en vez de quedar vacía.
-test('sin agentes externos, la orquestación lo dice', async $ => {
+test('un peso 0 no despierta a Codex: lo hace esta sesión, con haiku y sin revisor', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(900, 'Un literal de color pasa a token')], { cola: [900] })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  const a = repo.escrito().asignaciones['900']
+  expect(a.trabajador).toBe('claude')
+  expect(a.peso).toBe('XS')
+  expect(a.modelo).toBe('haiku')
+  expect(a.contra).toBeUndefined()
+  expect(respuesta).not.toContain('Codex')
+})
+
+test('«/consumo agentes» responde en frases y no contiene la palabra «llamadas»', async ($, on) => {
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('El próximo despertar sigue con ella')
+  expect(respuesta).not.toContain('llamadas')
+  expect(respuesta).not.toContain('USD')
+  expect(respuesta).not.toContain('tokens')
+})
+
+test('un trabajador en fuera no recibe nada, ni como revisor de un peso L', async ($, on) => {
+  const larga = 'Migración con RLS, API y pantalla web. Se acredita en el navegador.'
+  const repo = repositorioDePrueba(on, [issue(342, 'Nueva tabla con su pantalla', [], larga)], { cola: [342], fuera: { codex: 'sin cuota' } })
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const a = repo.escrito().asignaciones['342']
+  expect(a.peso).toBe('L')
+  expect(a.trabajador).toBe('claude')
+  expect(a.contra).toBe('agy')
+  const rechazo = JSON.stringify(await $.command.run({ command: 'consumo', args: 'tomar 342 codex' } as never))
+  expect(rechazo).toContain('codex está fuera (sin cuota)')
+})
+
+test('el panel se lee en tres preguntas y la tercera es la orden del control', async ($, on) => {
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] })
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
   const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
-  expect(await pane.find({ text: /Orquestación · 0 agentes externos/ })).toBeDefined()
-  expect(await pane.find({ text: /ningún agente externo con rama/ })).toBeDefined()
+  expect(await pane.find({ text: /1 · ¿Cuánto queda de presupuesto y de contexto\?/ })).toBeDefined()
+  expect(await pane.find({ text: /2 · ¿Esta semana se cierra trabajo o sólo se gasta\?/ })).toBeDefined()
+  expect(await pane.find({ text: /3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar\?/ })).toBeDefined()
+  expect(await pane.find({ text: /Esta sesión tiene la #346/ })).toBeDefined()
 })
 
 // Un repositorio configurado a mano manda sobre el detectado y se ve en el título del avance.
@@ -174,7 +213,7 @@ test('recién abierta y sin pytest: ni error de transcripción ni sección de co
   expect(JSON.stringify(respuesta)).toContain('no-aplica')
   const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
   expect(await pane.find({ text: /sesión recién abierta: aún sin gasto/ })).toBeDefined()
-  expect(await pane.find({ text: /sin tarea todavía/ })).toBeDefined()
+  expect(await pane.find({ text: /el control no decide aquí|El control todavía no decidió/ })).toBeDefined()
   expect(await pane.find({ text: /no existe la transcripcion/ })).toBeUndefined()
   expect(await pane.find({ text: /Cobertura de pruebas/ })).toBeUndefined()
   expect(await pane.find({ type: 'Button', text: /pytest/ })).toBeUndefined()

@@ -1,10 +1,27 @@
 {
-  "_nota": "Copia este fichero a .claude/orquestacion.json en la raíz de TU repositorio. `fuera`: agente → motivo. `reasignado`: número de issue → quién la tomó. La actividad se deduce de git; aquí sólo va lo que git no puede saber.",
+  "_nota": "Fichero del control de consumo 2.0. Tú escribes cola, fuera, declarado y no_tocar; el control escribe asignaciones, clasificacion y router.",
+  "cola": [
+    101,
+    102,
+    103
+  ],
   "fuera": {
     "codex": "sin cuota de tokens desde el 07-10"
   },
-  "reasignado": {
-    "344": "claude",
-    "314": "claude"
-  }
+  "declarado": {
+    "101": {
+      "clase": "Cierre",
+      "solo_sesion": true,
+      "falta": "validar en navegador y desplegar",
+      "capas": false,
+      "sensible": true,
+      "diagnostico": false,
+      "navegador": true,
+      "produccion": true
+    }
+  },
+  "no_tocar": [
+    "definicion/",
+    ".env"
+  ]
 }

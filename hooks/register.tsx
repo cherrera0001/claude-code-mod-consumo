@@ -1,9 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Avance, Cobertura, FilaTarea, GitHub, Orquestacion, Resumen, Sesion } from '../types'
+import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion } from '../types'
+import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, pesar, resto, tabla } from './router'
+import type { Actividad, Asignacion, Estado, Issue, Salida, Trabajador } from './router'
 
-// Tablero de consumo, leído como el indicador de combustible de un vehículo: cuánto tanque de contexto
+// consumo 2.0 mide, gestiona y controla. Mide como antes. Gestiona la cola y quién tiene cada issue. Controla:
+// en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y lo escribe en
+// .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece (la decisión vive en router.ts).
+// La parte que mide se lee como el indicador de combustible de un vehículo: cuánto tanque de contexto
 // queda, cuánto presupuesto va gastado, a qué ritmo se gasta y cuánta autonomía da; qué tarea se está
 // construyendo, qué espera el bucle y qué queda pendiente en GitHub. Solo lee; ejecuta el resumidor en
 // Python (embebido abajo, por stdin), `gh` para GitHub y, a pedido, pytest con cobertura.
@@ -53,194 +58,17 @@ const avance = atom({ plugin: 'consumo', key: 'avance' } as const, {
   reparto: [],
 } as Avance)
 
-// Orquestación: qué agentes trabajan en el repositorio (ramas `<agente>/<issue>`), cuáles siguen activos,
-// cuál quedó fuera y qué issues hay que redistribuir.
-const orquestacion = atom({ plugin: 'consumo', key: 'orquestacion' } as const, {
+// El control: la última decisión del router, en frases. Es lo que pinta la tercera pregunta del panel y lo
+// que el prompt de sistema le repite a quien despierta.
+const control = atom({ plugin: 'consumo', key: 'control' } as const, {
   cuando: null,
-  error: '',
-  agentes: [],
-  externos: 0,
-  externos_activos: 0,
-  subagentes: { total: 0, activos: 0, ultimos: [] },
-  por_redistribuir: [],
-} as Orquestacion)
-
-// El guion de orquestación, tal cual está en hooks/orquestacion.py; por stdin, como los otros dos.
-const ORQUESTA_PY = `
-from __future__ import annotations
-
-import glob
-import json
-import os
-import re
-import subprocess
-import sys
-import time
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-# Orquestacion: quienes estan trabajando en este repositorio, en que, y quien quedo fuera.
-# Solo lee: git (arboles de trabajo y ramas), el fichero .claude/orquestacion.json del proyecto y las
-# transcripciones de los subagentes de la sesion. Fuente en ASCII y sin barras invertidas: va embebida.
-#
-# Convencion: un agente externo trabaja en una rama <agente>/<issue> (codex/344, agy/345), en su propio
-# arbol de trabajo. El estado se deduce de la actividad; "fuera" se declara en .claude/orquestacion.json:
-#   {"fuera": {"codex": "sin cuota desde el 07-10"}, "reasignado": {"314": "claude"}}
-
-NO_SON_AGENTES = {"fix", "feat", "feature", "ci", "chore", "docs", "hotfix", "release", "integracion",
-                  "test", "refactor", "bugfix", "agents", "worktree", "dependabot", "renovate", "revert"}
-ACTIVO_S = 30 * 60
-VIGENTE_S = 7 * 24 * 3600
-SUBAGENTE_ACTIVO_S = 10 * 60
-
-
-def arg(nombre, defecto=""):
-    return sys.argv[sys.argv.index(nombre) + 1] if nombre in sys.argv else defecto
-
-
-def git(raiz, *a):
-    try:
-        r = subprocess.run(["git", "-C", raiz, *a], capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=25)
-        return r.stdout if r.returncode == 0 else ""
-    except Exception:
-        return ""
-
-
-def agente_de(rama):
-    m = re.match("^([A-Za-z][A-Za-z0-9_-]*)/([0-9]+)", rama)
-    if not m or m.group(1).lower() in NO_SON_AGENTES:
-        return None
-    return m.group(1).lower(), int(m.group(2))
-
-
-def entero(texto, defecto=0):
-    try:
-        return int(texto.strip())
-    except Exception:
-        return defecto
-
-
-def actividad_del_arbol(ruta, ultimo_commit):
-    # Lo mas reciente entre el ultimo commit y los ficheros con cambios sin confirmar.
-    reciente = ultimo_commit
-    sucios = 0
-    for linea in git(ruta, "status", "--porcelain").splitlines():
-        sucios += 1
-        if sucios > 60:
-            continue
-        nombre = linea[3:].strip().strip(chr(34))
-        if " -> " in nombre:
-            nombre = nombre.split(" -> ")[-1]
-        try:
-            reciente = max(reciente, os.path.getmtime(os.path.join(ruta, nombre)))
-        except OSError:
-            pass
-    return reciente, sucios
-
-
-def main():
-    raiz = arg("--raiz", os.getcwd())
-    sesion = arg("--sesion")
-    cwd = arg("--cwd", raiz)
-    ahora = time.time()
-    base = git(raiz, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip() or "origin/main"
-
-    declarado = {}
-    try:
-        declarado = json.load(open(os.path.join(raiz, ".claude", "orquestacion.json"), encoding="utf-8"))
-    except Exception:
-        declarado = {}
-    fuera = {str(k).lower(): str(v) for k, v in (declarado.get("fuera") or {}).items()}
-    reasignado = {str(k): str(v) for k, v in (declarado.get("reasignado") or {}).items()}
-
-    filas = {}
-
-    def anotar(nombre, issue, rama, ruta):
-        ultimo = entero(git(raiz, "log", "-1", "--format=%ct", rama), 0)
-        commits = entero(git(raiz, "rev-list", "--count", base + ".." + rama), 0)
-        reciente, sucios = (ultimo, 0)
-        if ruta:
-            reciente, sucios = actividad_del_arbol(ruta, ultimo)
-        if not reciente or ahora - reciente > VIGENTE_S:
-            return
-        clave = nombre + "/" + str(issue)
-        previa = filas.get(clave)
-        if previa and previa["ultima"] >= reciente and not ruta:
-            return
-        filas[clave] = {"nombre": nombre, "issue": issue, "rama": rama, "commits": commits, "sin_confirmar": sucios,
-                        "ultima": reciente or None, "con_arbol": bool(ruta)}
-
-    bloque = {}
-    for linea in git(raiz, "worktree", "list", "--porcelain").splitlines() + [""]:
-        if linea.startswith("worktree "):
-            bloque = {"ruta": linea[9:].strip()}
-        elif linea.startswith("branch "):
-            bloque["rama"] = linea[7:].strip().replace("refs/heads/", "")
-        elif not linea.strip() and bloque:
-            quien = agente_de(bloque.get("rama", ""))
-            if quien:
-                anotar(quien[0], quien[1], bloque["rama"], bloque.get("ruta", ""))
-            bloque = {}
-
-    for rama in git(raiz, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin").splitlines():
-        corta = rama.strip()[len("origin/"):] if rama.strip().startswith("origin/") else rama.strip()
-        quien = agente_de(corta)
-        if quien and (quien[0] + "/" + str(quien[1])) not in filas:
-            anotar(quien[0], quien[1], rama.strip(), "")
-
-    agentes = []
-    for f in sorted(filas.values(), key=lambda x: (x["nombre"], x["issue"])):
-        hace = (ahora - f["ultima"]) if f["ultima"] else None
-        if f["nombre"] in fuera:
-            estado, motivo = "fuera", fuera[f["nombre"]]
-        elif hace is not None and hace < ACTIVO_S:
-            estado, motivo = "activo", ""
-        else:
-            estado, motivo = "inactivo", ""
-        agentes.append(dict(f, estado=estado, motivo=motivo,
-                            hace_min=round(hace / 60, 1) if hace is not None else None,
-                            reasignado_a=reasignado.get(str(f["issue"]), "")))
-    # Quien esta declarado fuera aunque no tenga rama a la vista.
-    for nombre, motivo in fuera.items():
-        if not any(a["nombre"] == nombre for a in agentes):
-            agentes.append({"nombre": nombre, "issue": None, "rama": "", "commits": 0, "sin_confirmar": 0, "ultima": None,
-                            "con_arbol": False, "estado": "fuera", "motivo": motivo, "hace_min": None, "reasignado_a": ""})
-
-    subagentes = []
-    if sesion:
-        codificada = "".join(c if (c.isascii() and c.isalnum()) else "-" for c in cwd)
-        carpeta = os.path.join(os.environ.get("USERPROFILE") or os.path.expanduser("~"), ".claude", "projects",
-                               codificada, sesion, "subagents")
-        for ruta in sorted(glob.glob(os.path.join(carpeta, "agent-*.jsonl")), key=os.path.getmtime):
-            etiqueta = ""
-            try:
-                meta = json.load(open(ruta[:-len(".jsonl")] + ".meta.json", encoding="utf-8"))
-                for clave in ("description", "agentType", "subagent_type", "name"):
-                    if isinstance(meta.get(clave), str) and meta[clave].strip():
-                        etiqueta = " ".join(meta[clave].split())[:48]
-                        break
-            except Exception:
-                pass
-            hace = ahora - os.path.getmtime(ruta)
-            subagentes.append({"etiqueta": etiqueta or os.path.basename(ruta)[6:14], "hace_min": round(hace / 60, 1),
-                               "activo": hace < SUBAGENTE_ACTIVO_S})
-
-    por_redistribuir = sorted({a["issue"] for a in agentes
-                               if a["issue"] is not None and a["estado"] != "activo" and not a["reasignado_a"]})
-    print(json.dumps({
-        "ahora": ahora,
-        "agentes": agentes,
-        "externos": len({a["nombre"] for a in agentes}),
-        "externos_activos": len({a["nombre"] for a in agentes if a["estado"] == "activo"}),
-        "subagentes": {"total": len(subagentes), "activos": sum(1 for s in subagentes if s["activo"]),
-                       "ultimos": subagentes[-4:]},
-        "por_redistribuir": por_redistribuir,
-    }, ensure_ascii=False))
-
-
-main()
-`
+  activo: false,
+  github: '',
+  candado: '',
+  frases: [],
+  resto: [],
+  avisos: [],
+} as Control)
 
 // El resumidor, tal cual está en hooks/resumen_transcripcion.py; se ejecuta por stdin porque el módulo
 // no conoce su propia carpeta (`options` trae solo la configuración del usuario).
@@ -828,52 +656,261 @@ async function pythonDe($: any, root: string): Promise<string> {
   return (await $.fs.exists(venv)) ? venv : 'python'
 }
 
-async function leerOrquestacion($: any): Promise<void> {
-  const ahora = await $.clock.now()
+const barras = (ruta: string): string => ruta.replace(/\\/g, '/').replace(/\/+$/, '')
+const primeraLinea = (t: string): string => (t.split(/\r?\n/).find(l => l.trim()) ?? '').trim().slice(0, 160)
+
+async function correr($: any, argv: string[], cwd: string, timeoutMs = 30_000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
-    const id = await $.session.id()
-    const cwd = await $.session.cwd()
-    const root = await $.session.root()
-    const py = await pythonDe($, root)
-    const r = await $.process.run([py, '-I', '-', '--raiz', root, '--cwd', cwd, '--sesion', id], {
-      stdin: ORQUESTA_PY,
-      env: { PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
-      timeoutMs: 60_000,
-    })
-    if (r.exitCode === 0 && r.stdout.trim()) {
-      const d = JSON.parse(r.stdout)
-      await update($, orquestacion, () => ({
-        cuando: ahora,
-        error: '',
-        agentes: Array.isArray(d.agentes) ? d.agentes : [],
-        externos: Number(d.externos ?? 0),
-        externos_activos: Number(d.externos_activos ?? 0),
-        // Se comprueba la forma: una salida que no es la del guion no puede romper el dibujo.
-        subagentes:
-          d.subagentes && Array.isArray(d.subagentes.ultimos)
-            ? { total: Number(d.subagentes.total ?? 0), activos: Number(d.subagentes.activos ?? 0), ultimos: d.subagentes.ultimos }
-            : { total: 0, activos: 0, ultimos: [] },
-        por_redistribuir: Array.isArray(d.por_redistribuir) ? d.por_redistribuir : [],
-      }))
-      return
-    }
-    const motivo = (r.stderr || 'la orquestación no devolvió nada').trim().split('\n').slice(-1)[0] ?? ''
-    await update($, orquestacion, o => ({ ...o, cuando: ahora, error: motivo.slice(0, 160) }))
+    const r = await $.process.run(argv, { cwd, timeoutMs })
+    return { ok: r.exitCode === 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
   } catch (exc) {
-    await update($, orquestacion, o => ({ ...o, cuando: ahora, error: String(exc).slice(0, 160) }))
+    return { ok: false, stdout: '', stderr: String(exc) }
   }
 }
 
-function lineaOrquestacion(o: Orquestacion): string {
-  if (o.error) return `orquestación: ${o.error}`
-  const fuera = o.agentes.filter(a => a.estado === 'fuera').map(a => a.nombre)
-  const unicos = [...new Set(fuera)]
-  const redistribuir = o.por_redistribuir.length > 0 ? ` · por redistribuir: ${o.por_redistribuir.map(n => '#' + n).join(', ')}` : ''
-  return `orquestación: ${o.externos} agentes externos (${o.externos_activos} activos${unicos.length > 0 ? `, fuera: ${unicos.join(', ')}` : ''}) · ${o.subagentes.total} subagentes de la sesión (${o.subagentes.activos} activos)${redistribuir}`
+// GitHub del producto sólo con el envoltorio del repositorio: su token y su identidad, comprobada por él.
+function ghDelProyecto(raiz: string, ...orden: string[]): string[] {
+  return ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `${raiz}/scripts/gh-vt.ps1`, ...orden]
+}
+
+async function leerEstado($: any, raiz: string): Promise<{ estado: Estado; texto: string }> {
+  try {
+    const leido = String(await $.fs.read(`${raiz}/.claude/orquestacion.json`))
+    return { estado: JSON.parse(leido) as Estado, texto: leido }
+  } catch {
+    return { estado: {}, texto: '' }
+  }
+}
+
+/** Las issues abiertas, de GitHub y no de un recuerdo. Si GitHub no responde, se dice y no se inventa nada. */
+async function leerIssues($: any, raiz: string, repoGh: string): Promise<{ issues: Issue[] | null; github: string }> {
+  if (!repoGh) return { issues: null, github: 'NO MEDIDO: el repositorio no tiene remoto de GitHub' }
+  const base = ['issue', 'list', '--repo', repoGh, '--state', 'open', '--limit', '300', '--json']
+  let conProyecto = true
+  let r = await correr($, ghDelProyecto(raiz, ...base, 'number,title,labels,body,projectItems'), raiz, 60_000)
+  if (!r.ok) {
+    conProyecto = false
+    r = await correr($, ghDelProyecto(raiz, ...base, 'number,title,labels,body'), raiz, 60_000)
+  }
+  if (!r.ok) return { issues: null, github: `NO MEDIDO: ${primeraLinea(r.stderr) || 'gh-vt.ps1 no respondió'}` }
+  try {
+    const filas = JSON.parse(r.stdout) as { number: number; title: string; labels?: { name: string }[]; body?: string; projectItems?: unknown[] }[]
+    return {
+      issues: filas.map(f => ({
+        numero: f.number,
+        titulo: f.title ?? '',
+        etiquetas: (f.labels ?? []).map(l => l.name),
+        cuerpo: f.body ?? '',
+        enProyecto: conProyecto ? (f.projectItems ?? []).length > 0 : null,
+        commits: [],
+        medida: true,
+      })),
+      github: conProyecto ? 'ok' : 'ok, sin la pertenencia al proyecto (la credencial no la deja leer)',
+    }
+  } catch {
+    return { issues: null, github: 'NO MEDIDO: la respuesta de gh no es JSON' }
+  }
+}
+
+/** Qué commits de main nombran cada issue: un solo `git log --grep`, repartido por número. */
+async function leerCommits($: any, raiz: string, numeros: number[]): Promise<Map<number, string[]>> {
+  const mapa = new Map<number, string[]>(numeros.map(n => [n, []]))
+  if (!numeros.length) return mapa
+  const r = await correr($, ['git', '-C', raiz, 'log', 'main', '--oneline', '-E', `--grep=#(${numeros.join('|')})([^0-9]|$)`, '-n', '400'], raiz)
+  for (const linea of r.stdout.split(/\r?\n/)) {
+    for (const n of numeros) {
+      if (new RegExp(`#${n}(?!\\d)`).test(linea)) mapa.get(n)!.push(linea.trim().slice(0, 120))
+    }
+  }
+  return mapa
+}
+
+/** Actividad de cada externo, medida por su rama agente/número: lo último entre su commit y sus ficheros sin confirmar. */
+async function leerActividad($: any, raiz: string, ahoraMs: number): Promise<Actividad> {
+  const actividad: Actividad = {}
+  for (const quien of EXTERNOS) {
+    const suArbol = arbol(raiz, quien)
+    const rama = (await correr($, ['git', '-C', suArbol, 'rev-parse', '--abbrev-ref', 'HEAD'], raiz, 15_000)).stdout.trim()
+    const m = new RegExp(`^${quien}/(\\d+)`).exec(rama)
+    if (!m) {
+      actividad[quien] = null
+      continue
+    }
+    let ultimo = Number((await correr($, ['git', '-C', suArbol, 'log', '-1', '--format=%ct'], raiz, 15_000)).stdout.trim()) * 1000 || 0
+    const sucios = (await correr($, ['git', '-C', suArbol, 'status', '--porcelain'], raiz, 20_000)).stdout.split(/\r?\n/).filter(Boolean).slice(0, 20)
+    for (const linea of sucios) {
+      const nombre = linea.slice(3).trim().replace(/^"|"$/g, '').split(' -> ').pop()!
+      try {
+        ultimo = Math.max(ultimo, (await $.fs.stat(`${suArbol}/${nombre}`)).mtimeMs)
+      } catch {
+        // Un fichero borrado no tiene hora: no cuenta.
+      }
+    }
+    actividad[quien] = { rama, issue: Number(m[1]), hace_min: ultimo ? (ahoraMs - ultimo) / 60_000 : Number.POSITIVE_INFINITY }
+  }
+  return actividad
+}
+
+async function candadoDeSuite($: any, raiz: string): Promise<string> {
+  try {
+    if (!(await $.fs.exists(`${raiz}/.vt-suite.lock`))) return ''
+    return primeraLinea(String(await $.fs.read(`${raiz}/.vt-suite.lock`)).replace(/\s+/g, ' ')) || 'tomado'
+  } catch {
+    return ''
+  }
+}
+
+/** Lo que lee quien despierta: la orden, en frases, y lo que no se delega. Sin cifras de consumo. */
+function textoDeControl(c: Control): string {
+  return [
+    'Control de consumo (decisión escrita en .claude/orquestacion.json). Obedécela: no tomes otra issue ni reasignes mientras haya una asignación vigente.',
+    ...c.frases,
+    ...c.resto,
+    ...c.avisos,
+    c.github === 'ok' || !c.github ? '' : `GitHub: ${c.github}. La clasificación sale de la cola escrita y de git; títulos, etiquetas y qué sigue abierto no están medidos.`,
+    c.candado ? `El candado .vt-suite.lock está tomado (${c.candado}): no lances pnpm verify, pnpm gate ni pnpm e2e.` : '',
+    'Empujar main, migrar producción y desplegar el API los hace esta sesión, nunca Agy ni Codex, y sólo con la orden del dueño. Integrar una rama: sólo con scripts/integrar-rama.sh.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+type Decision = { salida: Salida; github: string; texto: string; estado: Estado; raiz: string; repoGh: string }
+
+/**
+ * El control: mide, decide (router.ts) y escribe. Sólo actúa en un repositorio que tenga .claude/orquestacion.json.
+ * `cambio` aplica una orden a mano (fuera, tomar) sobre lo leído antes de decidir; si devuelve texto, es un rechazo.
+ */
+async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issues: Issue[]) => string | null): Promise<Decision | { error: string } | null> {
+  const raiz = barras(String(await $.session.root()))
+  if (!(await $.fs.exists(`${raiz}/.claude/orquestacion.json`))) {
+    await update($, control, c => ({ ...c, activo: false }))
+    return null
+  }
+  const { estado: leido, texto: antes } = await leerEstado($, raiz)
+  const repoGh = await repoDe($, repoCfg)
+  const { issues: medidas, github } = await leerIssues($, raiz, repoGh)
+  // Sin GitHub no se da nada por cerrado ni se inventan títulos: se enruta la cola escrita, marcada como no medida.
+  const colaEscrita = leido.cola?.length ? leido.cola : [...COLA_INICIAL]
+  const issues: Issue[] =
+    medidas ??
+    [...new Set([...colaEscrita, ...Object.keys(leido.asignaciones ?? {}).map(Number)])].map(numero => ({
+      numero,
+      titulo: leido.clasificacion?.find(f => f.numero === numero)?.titulo ?? '',
+      etiquetas: [],
+      cuerpo: '',
+      enProyecto: null,
+      commits: [],
+      medida: false,
+    }))
+  const commits = await leerCommits($, raiz, issues.map(i => i.numero))
+  for (const i of issues) i.commits = commits.get(i.numero) ?? []
+  if (cambio) {
+    const rechazo = cambio(leido, issues)
+    if (rechazo) return { error: rechazo }
+  }
+  const ahoraMs = await $.clock.now()
+  const salida = enrutar({
+    raiz,
+    issues,
+    estado: leido,
+    actividad: await leerActividad($, raiz, ahoraMs),
+    modeloSesion: corto(String(await $.session.model().catch(() => ''))),
+    ahora: new Date(ahoraMs).toISOString(),
+    abiertas: medidas ? new Set(medidas.map(i => i.numero)) : null,
+  })
+  const estado = conDecision(leido, salida, github, medidas ? medidas.length : null, leido.router?.pendientes ?? [])
+  const despues = `${JSON.stringify(estado, null, 2)}\n`
+  // Sólo se escribe si la decisión cambió: el fichero está versionado y un árbol sucio no se despliega.
+  if (despues !== antes) await $.fs.write(`${raiz}/.claude/orquestacion.json`, despues)
+  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida), resto: resto(salida), avisos: salida.avisos }
+  await update($, control, () => nuevo)
+  return { salida, github, texto: textoDeControl(nuevo), estado, raiz, repoGh }
+}
+
+function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, modelo: string, ahora: string, motivo: string): Asignacion {
+  const d = estado.declarado?.[String(i.numero)]
+  const { puntos } = pesar(i, d)
+  const t = tabla(puntos, modelo)
+  return {
+    trabajador: quien,
+    clase: clasificar(i, d),
+    puntos,
+    peso: t.peso,
+    esfuerzo: t.esfuerzo,
+    modelo: t.modelo,
+    estado: 'vigente',
+    desde: ahora,
+    motivo,
+    ...(quien === 'claude' ? {} : { arbol: arbol(raiz, quien), rama: `${quien}/${i.numero}` }),
+  }
+}
+
+/** «/consumo agentes | fuera <agy|codex> <motivo> | tomar <número> <agy|codex|claude>»: ejecuta el control y responde en frases. */
+async function ordenDeControl($: any, repoCfg: string, argumentos: string): Promise<string> {
+  const [orden = '', a = '', ...mas] = argumentos.split(/\s+/)
+  const raiz = barras(String(await $.session.root()))
+  const ahora = new Date(await $.clock.now()).toISOString()
+  const modelo = corto(String(await $.session.model().catch(() => '')))
+  let linea = ''
+  let nota: { numero: number; texto: string } | null = null
+  let cambio: ((estado: Estado, issues: Issue[]) => string | null) | undefined
+
+  if (orden.toLowerCase() === 'fuera') {
+    const quien = a.toLowerCase() as Trabajador
+    const motivo = mas.join(' ').trim()
+    if (!EXTERNOS.includes(quien) || !motivo) return 'Uso: «/consumo fuera <agy|codex> <motivo>». El motivo es obligatorio: queda visible.'
+    cambio = estado => {
+      estado.fuera = { ...(estado.fuera ?? {}), [quien]: `${motivo} (desde el ${ahora.slice(0, 10)})` }
+      linea = `${quien} queda fuera: ${motivo}.`
+      return null
+    }
+  } else if (orden.toLowerCase() === 'tomar') {
+    const numero = Number(a.replace('#', ''))
+    const quien = (mas[0] ?? '').toLowerCase() as Trabajador
+    if (!Number.isInteger(numero) || numero <= 0 || !TRABAJADORES.includes(quien)) return 'Uso: «/consumo tomar <número> <agy|codex|claude>».'
+    cambio = (estado, issues) => {
+      const i = issues.find(x => x.numero === numero)
+      if (!i) return `La #${numero} no está abierta ni en la cola: no se asigna.`
+      const d = estado.declarado?.[String(numero)]
+      const clase = clasificar(i, d)
+      if (clase === 'Decisión') return `La #${numero} es una Decisión: espera al dueño y no se asigna a nadie.`
+      if (clase === 'Épica') return `La #${numero} es una épica: no lleva modelo ni trabajador.`
+      const motivoFuera = estado.fuera?.[quien]
+      if (motivoFuera) return `${quien} está fuera (${motivoFuera}): no recibe la #${numero}.`
+      if (quien !== 'claude' && (d?.solo_sesion || pesar(i, d).criterios.produccion)) return `La #${numero} toca producción o está reservada a esta sesión: no se delega a ${quien}.`
+      const otra = Object.entries(estado.asignaciones ?? {}).find(([n, x]) => Number(n) !== numero && (x.trabajador === quien || x.contra === quien))
+      if (otra) return `${quien} ya tiene la #${otra[0]}. Un trabajador, una issue: libérala antes.`
+      const antes = estado.asignaciones?.[String(numero)]?.trabajador
+      const nueva = asignacionAMano(i, estado, quien, raiz, modelo, ahora, `reasignada a mano${antes ? ` desde ${antes}` : ''}`)
+      estado.asignaciones = { ...(estado.asignaciones ?? {}), [String(numero)]: nueva }
+      estado.reasignado = { ...(estado.reasignado ?? {}), [String(numero)]: `${quien} (a mano, ${ahora.slice(0, 10)})` }
+      linea = `La #${numero} pasa a ${quien}.`
+      nota = { numero, texto: `Control: la #${numero} pasa a ${quien}${antes ? ` (antes, ${antes})` : ''}; peso ${nueva.peso}, esfuerzo ${nueva.esfuerzo}. Reasignada a mano el ${ahora.slice(0, 10)}.` }
+      return null
+    }
+  }
+
+  const r = await controlar($, repoCfg, cambio)
+  if (!r) return 'Este repositorio no tiene .claude/orquestacion.json: el control no decide aquí.'
+  if ('error' in r) return r.error
+
+  const anotado: string[] = []
+  const pendiente = nota as { numero: number; texto: string } | null
+  if (pendiente) {
+    // Una línea en la issue, no un informe. Si GitHub no la acepta, queda pendiente y a la vista.
+    const c = await correr($, ghDelProyecto(r.raiz, 'issue', 'comment', String(pendiente.numero), '--repo', r.repoGh, '--body', pendiente.texto), r.raiz, 45_000)
+    if (c.ok) anotado.push(`Anotado en la #${pendiente.numero}.`)
+    else {
+      anotado.push(`No se pudo anotar en la #${pendiente.numero} (${primeraLinea(c.stderr) || 'gh-vt.ps1 falló'}): queda pendiente en .claude/orquestacion.json.`)
+      const conPendiente = { ...r.estado, router: { ...r.estado.router!, pendientes: [...(r.estado.router?.pendientes ?? []), `#${pendiente.numero}: ${pendiente.texto}`] } }
+      await $.fs.write(`${r.raiz}/.claude/orquestacion.json`, `${JSON.stringify(conPendiente, null, 2)}\n`)
+    }
+  }
+  return [linea, ...frases(r.salida), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
 }
 
 async function refrescar($: any): Promise<void> {
-  void leerOrquestacion($)
   const ahora = await $.clock.now()
   let error = ''
   try {
@@ -1129,8 +1166,10 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'consumo',
       description:
-        'Tablero de consumo: «/consumo» lo abre, «/consumo avance» mide issues cerradas y parte de la factura del proyecto, «/consumo agentes» dice quién trabaja en el repositorio y qué hay que redistribuir, «/consumo github» relee issues y PR, «/consumo cobertura» corre pytest con cobertura.',
+        'Mide, gestiona y controla: «/consumo» pinta el panel, «/consumo avance» mide el avance real, «/consumo agentes» ejecuta el control y dice quién tiene cada issue y qué hará el próximo despertar, «/consumo fuera <agy|codex> <motivo>» saca a un trabajador y mueve su issue, «/consumo tomar <número> <agy|codex|claude>» reasigna a mano, «/consumo github» relee issues y PR, «/consumo cobertura» corre pytest con cobertura.',
     })
+    // Controla antes de pintar: si no hay asignación vigente, asigna la primera de la cola que no espere al dueño.
+    await controlar($, repo).catch(() => null)
     void $.ui.open({ id: PANE, title: 'Consumo' })
     void refrescar($)
     void actualizarCobertura($, false)
@@ -1152,6 +1191,23 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Cada despertar del bucle vuelve a decidir, y recibe la decisión junto a su prompt.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin?.kind !== 'scheduled-trigger') return next(e)
+    const r = await controlar($, repo).catch(() => null)
+    if (!r || 'error' in r) return next(e)
+    return next({ ...e, context: [...(e.context ?? []), r.texto] })
+    // Si el control falla, el prompt entra igual: un despertar nunca se pierde por él.
+  }).catch(($, e, next) => next(e))
+
+  // La decisión vigente va en el prompt de sistema: es donde la lee quien empieza a trabajar.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    const c = await read($, control)
+    if (!c.activo || c.frases.length === 0) return r
+    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: textoDeControl(c), scope: 'session' as const }] }
+  })
+
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId === undefined) void refrescar($)
@@ -1168,9 +1224,8 @@ export const register: Register = (on, options) => {
     if (args.startsWith('avance')) {
       return { text: lineaAvance(await medirAvance($, repo, cuenta, factura, true)) }
     }
-    if (args.startsWith('agentes') || args.startsWith('orquesta')) {
-      await leerOrquestacion($)
-      return { text: lineaOrquestacion(await read($, orquestacion)) }
+    if (args.startsWith('agentes') || args.startsWith('fuera') || args.startsWith('tomar')) {
+      return { text: await ordenDeControl($, repo, e.args.trim()) }
     }
     if (args.startsWith('github')) {
       await consultarGitHub($, repo, cuenta)
@@ -1188,15 +1243,13 @@ export const register: Register = (on, options) => {
     const c = await read($, cobertura)
     const g = await read($, github)
     const av = await read($, avance)
-    const orq = await read($, orquestacion)
+    const ctl = await read($, control)
     const conIssues = av.repo !== null && !av.repo.error
     const semanaActual = av.semanas[av.semanas.length - 1] ?? null
-    const sinCierres = conIssues && semanaActual !== null && semanaActual.hechas === 0 && semanaActual.usd_factura >= 1
     const recienAbierta = !r || r.sin_transcripcion === true || r.total.llamadas === 0
     const conCobertura = c.estado !== 'no-aplica'
     const ancho = Math.max(44, e.props.bodyColumns ?? 70)
     const anchoBarra = Math.min(24, Math.max(10, ancho - 50))
-    const anchoTitulo = Math.max(16, ancho - 34)
 
     const gastado = s.usdMotor ?? (r ? r.total.usd : null)
     const fPresupuesto = gastado === null || presupuesto <= 0 ? null : gastado / presupuesto
@@ -1204,36 +1257,32 @@ export const register: Register = (on, options) => {
     const ritmoHora = r ? r.ritmo.usd_por_hora : 0
     const autonomiaMin = gastado === null || ritmoHora <= 0 ? null : ((presupuesto - gastado) / ritmoHora) * 60
     const minutosSesion = s.inicio === null ? null : (Date.now() - s.inicio) / 60_000
-    const actual: FilaTarea | null = r ? r.actual : null
     const d = r ? r.despertador : null
-    const tareas = r ? r.por_tarea.filter(t => t !== r.actual).slice(-5) : []
-    const modelos = r ? r.por_modelo : []
 
+    // El panel se lee en tres preguntas, en este orden. Cada cifra sale una vez y ninguna frase se corta.
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
-          <Text bold>
-            Consumo · sesión de {duracion(minutosSesion)} · {s.usdMotor === null ? 'motor —' : `motor ${s.usdMotor.toFixed(2)} USD`} · estimado{' '}
-            {r ? r.total.usd.toFixed(2) + ' USD' : '—'} · {hora(s.actualizado)}
+          <Text bold wrap="wrap">
+            1 · ¿Cuánto queda de presupuesto y de contexto? · sesión de {duracion(minutosSesion)} · {hora(s.actualizado)}
           </Text>
-          <Text>
-            {'Tanque de contexto '.padEnd(22)}
-            <Text color={tono(fContexto)}>{barra(fContexto, anchoBarra)}</Text>{' '}
-            {s.contextoPct === null ? 'se mide con la primera respuesta' : `${s.contextoPct} %`}
-            {s.contextoTokens === null ? '' : ` · ${miles(s.contextoTokens)}${s.ventana ? ' de ' + miles(s.ventana) : ''}`}
-          </Text>
-          <Text>
+          <Text wrap="wrap">
             {`Presupuesto ${presupuesto} USD`.padEnd(22)}
             <Text color={tono(fPresupuesto)}>{barra(fPresupuesto, anchoBarra)}</Text>{' '}
-            {fPresupuesto === null ? '—' : `${Math.round(fPresupuesto * 100)} %`}
-            {gastado === null ? '' : ` · ${gastado.toFixed(2)} USD`}
+            {gastado === null || fPresupuesto === null ? 'sin gasto medido todavía' : `quedan ${Math.max(0, presupuesto - gastado).toFixed(2)} USD (gastado el ${Math.round(fPresupuesto * 100)} %)`}
           </Text>
-          <Text>
+          <Text wrap="wrap">
+            {'Tanque de contexto '.padEnd(22)}
+            <Text color={tono(fContexto)}>{barra(fContexto, anchoBarra)}</Text>{' '}
+            {s.contextoPct === null ? 'se mide con la primera respuesta' : `queda libre el ${Math.max(0, 100 - s.contextoPct)} %`}
+            {s.contextoTokens === null ? '' : ` · ocupados ${miles(s.contextoTokens)}${s.ventana ? ' de ' + miles(s.ventana) : ''}`}
+          </Text>
+          <Text wrap="wrap">
             {'Ritmo (última hora) '.padEnd(22)}
             <Text color="cyan">{r ? chispas(r.ritmo.cubos_usd) : '▁'.repeat(12)}</Text>{' '}
-            {recienAbierta || !r ? 'sin respuestas todavía' : `${ritmoHora.toFixed(1)} USD/h · ${r.ritmo.usd_ultimos_30_min.toFixed(2)} USD en 30 min`}
+            {recienAbierta || !r ? 'sin respuestas todavía' : `${ritmoHora.toFixed(1)} USD/h`}
           </Text>
-          <Text>
+          <Text wrap="wrap">
             {'Autonomía '.padEnd(22)}
             {recienAbierta
               ? 'sesión recién abierta: aún sin gasto'
@@ -1243,159 +1292,123 @@ export const register: Register = (on, options) => {
                   : '—'
                 : `${duracion(autonomiaMin)} hasta el presupuesto, al ritmo actual`}
           </Text>
-          {s.error ? <Text color="red">{s.error}</Text> : null}
+          {s.error ? <Text color="red" wrap="wrap">{s.error}</Text> : null}
         </Box>
 
         <Box flexDirection="column">
-          <Text bold>
-            Avance real · {av.repo && av.repo.nombre ? av.repo.nombre : repo || g.repo || 'repositorio por detectar'}
+          <Text bold wrap="wrap">
+            2 · ¿Esta semana se cierra trabajo o sólo se gasta? · Avance real · {av.repo && av.repo.nombre ? av.repo.nombre : repo || g.repo || 'repositorio por detectar'}
             {av.desde ? ` · desde el ${fechaCorta(av.desde)}` : ''}
             {av.cuando === null ? '' : ` · medido ${hora(av.cuando)}`}
             {av.estado === 'midiendo' ? (av.cuando === null ? ' · midiendo…' : ' · midiendo de nuevo…') : av.cuando === null ? ' · sin medir' : ''}
           </Text>
-          {av.error ? <Text color="red">{av.error}</Text> : null}
-          {av.repo && av.repo.error ? <Text color="red">GitHub: {av.repo.error}</Text> : null}
+          {av.error ? <Text color="red" wrap="wrap">{av.error}</Text> : null}
+          {av.repo && av.repo.error ? <Text color="red" wrap="wrap">GitHub: {av.repo.error}</Text> : null}
+          {conIssues && semanaActual ? (
+            semanaActual.hechas > 0 ? (
+              <Text color="green" wrap="wrap">
+                Se cierra trabajo. Esta semana: {semanaActual.hechas} issues cerradas con ≈ {semanaActual.usd_factura.toFixed(0)} USD de consumo ({semanaActual.creadas} creadas)
+              </Text>
+            ) : semanaActual.usd_factura >= 1 ? (
+              <Text color="red" wrap="wrap">
+                Sólo se gasta. Esta semana: ≈ {semanaActual.usd_factura.toFixed(0)} USD de consumo y ninguna issue cerrada ({semanaActual.creadas} creadas)
+              </Text>
+            ) : (
+              <Text dimColor wrap="wrap">Esta semana todavía no tiene consumo ni cierres que contar</Text>
+            )
+          ) : null}
           {av.repo && conIssues ? (
-            <Text wrap="truncate-end">
+            <Text wrap="wrap">
               Issues: {av.repo.hechas} cerradas · {av.repo.descartadas} descartadas · {av.repo.creadas} creadas · {av.repo.abiertas} abiertas hoy
             </Text>
           ) : null}
-          {av.repo && conIssues && proyeccion(av) ? <Text wrap="truncate-end">{proyeccion(av)}</Text> : null}
+          {av.repo && conIssues && proyeccion(av) ? <Text wrap="wrap">{proyeccion(av)}</Text> : null}
           {av.proyecto ? (
-            <Text wrap="truncate-end">
+            <Text wrap="wrap">
               Factura de {av.factura} USD: este proyecto ≈ {av.proyecto.usd_factura.toFixed(0)} USD ({av.proyecto.pct_del_total} %)
               {av.repo && av.repo.usd_por_issue !== null ? ` · ≈ ${av.repo.usd_por_issue.toFixed(2)} USD por issue cerrada` : ''}
             </Text>
           ) : (
-            <Text dimColor>
+            <Text dimColor wrap="wrap">
               {av.estado === 'midiendo'
                 ? 'midiendo: lee las transcripciones de esta máquina y las issues del repositorio (medio minuto)'
                 : 'sin medición todavía: «/consumo avance» la corre (tarda medio minuto)'}
             </Text>
           )}
-          {sinCierres && semanaActual ? (
-            <Text color="red" wrap="truncate-end">
-              Esta semana: ≈ {semanaActual.usd_factura.toFixed(0)} USD de consumo y ninguna issue cerrada ({semanaActual.creadas} creadas)
-            </Text>
-          ) : null}
-          {av.semanas.map(s => (
-            <Text wrap="truncate-end">
-              {fechaCorta(s.lunes)}{' '}
-              <Text color={!conIssues ? 'gray' : s.hechas === 0 && s.usd_factura >= 1 ? 'red' : 'green'}>{String(s.hechas).padStart(3)} cerradas</Text> ·{' '}
-              {String(s.creadas).padStart(3)} creadas · {String(s.abiertas_fin).padStart(3)} abiertas · {barra(s.pct_del_proyecto / 100, 8)}{' '}
-              {s.usd_factura.toFixed(0).padStart(3)} USD
+          {av.semanas.slice(0, -1).map(sem => (
+            <Text wrap="wrap">
+              {fechaCorta(sem.lunes)}{' '}
+              <Text color={!conIssues ? 'gray' : sem.hechas === 0 && sem.usd_factura >= 1 ? 'red' : 'green'}>{String(sem.hechas).padStart(3)} cerradas</Text> ·{' '}
+              {String(sem.creadas).padStart(3)} creadas · {String(sem.abiertas_fin).padStart(3)} abiertas · {barra(sem.pct_del_proyecto / 100, 8)}{' '}
+              {sem.usd_factura.toFixed(0).padStart(3)} USD
             </Text>
           ))}
           {av.proyecto ? (
-            <Text wrap="truncate-end">
+            <Text wrap="wrap">
               Iteración: {av.proyecto.despertares} despertares del bucle, {av.proyecto.despertares_vacios} sin cambios · {av.proyecto.agentes} subagentes (
               {av.proyecto.pct_subagentes} % del consumo) · releer contexto {av.proyecto.pct_relectura} %
             </Text>
           ) : null}
           {av.reparto.length > 0 ? (
-            <Text dimColor wrap="truncate-end">
+            <Text dimColor wrap="wrap">
               Reparto de la factura: {av.reparto.map(p => `${p.nombre} ${p.pct} %`).join(' · ')}
+            </Text>
+          ) : null}
+          {g.error ? <Text color="red" wrap="wrap">GitHub: {g.error}</Text> : null}
+          <Text wrap="wrap">
+            Pendiente en GitHub · {hora(g.cuando)} · PR abiertos {cuantos(g.prs.length)} ({g.prs.filter(p => p.isDraft).length} en borrador)
+            {g.cuando === null ? ' · leyendo…' : g.prs.length ? ': ' + g.prs.slice(0, VISIBLES_GITHUB).map(p => `#${p.number}${p.isDraft ? ' (borrador)' : ''} ${p.title}`).join(' · ') : ''}
+            {conIssues ? '' : ` · issues abiertas ${cuantos(g.issues.length)}`}
+          </Text>
+          {conCobertura ? (
+            <Text wrap="wrap">
+              Cobertura de pruebas del repositorio: {c.total === null ? `sin dato (${c.estado})` : `${c.total} %`} · medida {hora(c.cuando)} · {c.nota}
             </Text>
           ) : null}
         </Box>
 
         <Box flexDirection="column">
-          <Text bold>Ahora</Text>
-          {actual ? (
-            <Text wrap="truncate-end">
-              Tarea: «{actual.titulo.slice(0, anchoTitulo)}» · {duracion(actual.minutos)} · {actual.llamadas} llamadas · {actual.usd.toFixed(2)} USD · última respuesta hace{' '}
-              {duracion(actual.hace_min ?? null)}
+          <Text bold wrap="wrap">
+            3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar?{ctl.cuando === null ? '' : ` · decidido ${hora(ctl.cuando)}`}
+          </Text>
+          {!ctl.activo ? (
+            <Text dimColor wrap="wrap">
+              {ctl.cuando === null && ctl.frases.length === 0
+                ? 'El control todavía no decidió, o este repositorio no tiene .claude/orquestacion.json: «/consumo agentes» lo ejecuta'
+                : 'Este repositorio no tiene .claude/orquestacion.json: el control no decide aquí'}
             </Text>
-          ) : (
-            <Text dimColor>sin tarea todavía: aparece con el primer mensaje de la sesión</Text>
-          )}
+          ) : null}
+          {ctl.frases.map(f => (
+            <Text wrap="wrap">{f}</Text>
+          ))}
+          {ctl.resto.map(f => (
+            <Text dimColor wrap="wrap">
+              {f}
+            </Text>
+          ))}
+          {ctl.avisos.map(f => (
+            <Text color="yellow" wrap="wrap">
+              {f}
+            </Text>
+          ))}
+          {ctl.activo && ctl.github && ctl.github !== 'ok' ? (
+            <Text color="red" wrap="wrap">
+              GitHub: {ctl.github}. La decisión sale de la cola escrita y de git.
+            </Text>
+          ) : null}
+          {ctl.candado ? (
+            <Text color="red" wrap="wrap">
+              Candado de suites tomado ({ctl.candado}): el control no lanza verify, gate ni e2e.
+            </Text>
+          ) : null}
           {d ? (
-            <Text wrap="truncate-end">
+            <Text wrap="wrap">
               Bucle: {d.parar ? 'detenido' : `próximo despertar ${hora(d.proximo ? d.proximo * 1000 : null)}${d.faltan_min !== undefined ? ` (en ${duracion(d.faltan_min)})` : ''}`} · {d.razon}
             </Text>
           ) : (
             <Text dimColor>Bucle: ninguno programado</Text>
           )}
         </Box>
-
-        <Box flexDirection="column">
-          <Text bold>
-            Orquestación · {orq.externos} agentes externos ({orq.externos_activos} activos) · {orq.subagentes.total} subagentes de la sesión (
-            {orq.subagentes.activos} activos) · {hora(orq.cuando)}
-          </Text>
-          {orq.error ? <Text color="red">{orq.error}</Text> : null}
-          {orq.agentes.length === 0 && !orq.error ? (
-            <Text dimColor>ningún agente externo con rama «agente/issue» en la última semana</Text>
-          ) : null}
-          {orq.agentes.map(a => (
-            <Text wrap="truncate-end">
-              <Text color={a.estado === 'activo' ? 'green' : a.estado === 'fuera' ? 'red' : 'yellow'}>
-                {(a.estado === 'activo' ? 'activo' : a.estado === 'fuera' ? 'FUERA' : 'inactivo').padEnd(8)}
-              </Text>{' '}
-              {a.nombre.padEnd(8)} {a.issue === null ? '—' : `#${a.issue}`} · {a.commits} commits
-              {a.sin_confirmar > 0 ? ` · ${a.sin_confirmar} sin confirmar` : ''}
-              {a.hace_min === null ? '' : ` · última actividad hace ${duracion(a.hace_min)}`}
-              {a.motivo ? ` · ${a.motivo}` : ''}
-              {a.reasignado_a ? ` · reasignada a ${a.reasignado_a}` : ''}
-            </Text>
-          ))}
-          {orq.subagentes.ultimos.map(s => (
-            <Text dimColor wrap="truncate-end">
-              {s.activo ? '▸' : '·'} subagente «{s.etiqueta}» · {s.activo ? 'trabajando' : `terminó o calla hace ${duracion(s.hace_min)}`}
-            </Text>
-          ))}
-          {orq.por_redistribuir.length > 0 ? (
-            <Text color="red" wrap="truncate-end">
-              Por redistribuir: {orq.por_redistribuir.map(n => '#' + n).join(', ')} (su agente está inactivo o fuera y nadie las tomó)
-            </Text>
-          ) : null}
-        </Box>
-
-        <Box flexDirection="column">
-          <Text bold>
-            Pendiente en GitHub · {g.repo || repo || 'repositorio por detectar'} · {hora(g.cuando)}
-          </Text>
-          {g.error ? <Text color="red">{g.error}</Text> : null}
-          <Text wrap="truncate-end">
-            Issues abiertos {cuantos(g.issues.length)}:{' '}
-            {g.cuando === null ? 'leyendo…' : g.issues.slice(0, VISIBLES_GITHUB).map(i => `#${i.number} ${i.title.slice(0, 28)}`).join(' · ') || 'ninguno'}
-          </Text>
-          <Text wrap="truncate-end">
-            PR abiertos {cuantos(g.prs.length)} ({g.prs.filter(p => p.isDraft).length} en borrador):{' '}
-            {g.cuando === null ? 'leyendo…' : g.prs.slice(0, VISIBLES_GITHUB).map(p => `#${p.number}${p.isDraft ? '·b' : ''} ${p.title.slice(0, 22)}`).join(' · ') || 'ninguno'}
-          </Text>
-        </Box>
-
-        <Box flexDirection="column">
-          <Text bold>Por modelo</Text>
-          {modelos.length === 0 && <Text dimColor>sin respuestas todavía</Text>}
-          {modelos.map(m => (
-            <Text wrap="truncate-end">
-              {corto(m.modelo).padEnd(14)} {String(m.llamadas).padStart(4)} llam · salida {miles(m.output_tokens).padStart(5)} · caché {miles(m.cache_read_input_tokens).padStart(6)} leída,{' '}
-              {miles(m.cache_creation_input_tokens).padStart(5)} escrita · {m.usd.toFixed(2)} USD
-            </Text>
-          ))}
-        </Box>
-
-        <Box flexDirection="column">
-          <Text bold>Tareas anteriores (USD estimado)</Text>
-          {tareas.length === 0 && <Text dimColor>ninguna: la sesión lleva una sola tarea o ninguna</Text>}
-          {tareas.map(t => (
-            <Text wrap="truncate-end">
-              {t.usd.toFixed(2).padStart(7)} USD {String(t.llamadas).padStart(4)} llam {duracion(t.minutos).padStart(9)} {t.titulo.slice(0, anchoTitulo)}
-            </Text>
-          ))}
-          {r && r.subagentes.length > 0 ? <Text dimColor>Subagentes con consumo: {r.subagentes.length}</Text> : null}
-        </Box>
-
-        {conCobertura ? (
-          <Box flexDirection="column">
-            <Text bold>Cobertura de pruebas del repositorio</Text>
-            <Text>
-              {c.total === null ? `sin dato (${c.estado})` : `${c.total} %`} · medida {hora(c.cuando)} · {c.nota}
-            </Text>
-          </Box>
-        ) : null}
 
         <Box flexDirection="row" flexWrap="wrap" gap={2}>
           <Button hotkey="a" onPress={() => void refrescar($)}>
@@ -1407,13 +1420,16 @@ export const register: Register = (on, options) => {
           <Button hotkey="p" onPress={() => void medirAvance($, repo, cuenta, factura, true)}>
             Avance
           </Button>
+          <Button hotkey="o" onPress={() => void controlar($, repo)}>
+            Control
+          </Button>
           {conCobertura ? (
             <Button hotkey="c" onPress={() => void actualizarCobertura($, true)}>
               pytest
             </Button>
           ) : null}
         </Box>
-        {r ? <Text dimColor>{r.nota_precios}</Text> : null}
+        {r ? <Text dimColor wrap="wrap">{r.nota_precios}</Text> : null}
       </Box>
     )
   })

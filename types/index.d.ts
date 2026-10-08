@@ -163,36 +163,18 @@ export type Avance = {
   reparto: { nombre: string; pct: number; usd: number }[]
 }
 
-export type AgenteExterno = {
-  /** Prefijo de la rama: codex, agy… */
-  nombre: string
-  /** Issue de la rama `<agente>/<issue>`, o null si sólo consta como fuera. */
-  issue: number | null
-  rama: string
-  /** Commits por delante de la rama principal del remoto. */
-  commits: number
-  sin_confirmar: number
-  /** Segundos desde la época de su última actividad, o null. */
-  ultima: number | null
-  con_arbol: boolean
-  /** 'activo' | 'inactivo' | 'fuera' */
-  estado: string
-  /** Por qué está fuera, según `.claude/orquestacion.json`. */
-  motivo: string
-  hace_min: number | null
-  /** A quién se reasignó su issue, o ''. */
-  reasignado_a: string
-}
-
-export type Orquestacion = {
+/** La última decisión del control, en frases: quién tiene cada issue y qué hará el próximo despertar. */
+export type Control = {
   cuando: number | null
-  error: string
-  agentes: AgenteExterno[]
-  externos: number
-  externos_activos: number
-  subagentes: { total: number; activos: number; ultimos: { etiqueta: string; hace_min: number; activo: boolean }[] }
-  /** Issues de agentes inactivos o fuera que nadie tomó todavía. */
-  por_redistribuir: number[]
+  /** false: el repositorio de trabajo no tiene .claude/orquestacion.json y el control no decide en él. */
+  activo: boolean
+  /** «ok» o por qué no se pudieron leer las issues. */
+  github: string
+  /** Quién tiene tomado el candado de suites, o vacío. */
+  candado: string
+  frases: string[]
+  resto: string[]
+  avisos: string[]
 }
 
 declare module 'claude-code' {
@@ -203,7 +185,7 @@ declare module 'claude-code' {
       cobertura: Cobertura
       sesion: Sesion
       github: GitHub
-      orquestacion: Orquestacion
+      control: Control
     }
   }
 }

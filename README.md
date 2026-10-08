@@ -1,4 +1,4 @@
-# consumo — tablero de consumo y avance real para Claude Code
+# consumo — mide, gestiona y controla el trabajo en Claude Code
 
 Un *mod* (plugin de hooks) de Claude Code que abre un panel dentro de la sesión y responde a una
 pregunta que el costo por token no contesta: **¿cuánto trabajo real salió de lo que se gastó?**
@@ -7,23 +7,20 @@ Cruza tres fuentes que ya están en la máquina —las transcripciones locales d
 `gh`— y no envía nada a ningún servicio propio.
 
 ```
-Consumo · sesión de 5 h 47 min · motor 163.27 USD · estimado 195.47 USD · 15:05
-Tanque de contexto    ███████████████████░░░░░ 79 % · 786k de 1.0M
-Presupuesto 200 USD   ████████████████████░░░░ 82 % · 163.27 USD
-Ritmo (última hora)   ▃▁▁▁▁▁▁▁▂▃▄█ 16.8 USD/h · 8.41 USD en 30 min
-Autonomía             2 h 11 min hasta el presupuesto, al ritmo actual
+1 · ¿Cuánto queda de presupuesto y de contexto? · sesión de 5 h 47 min · 15:05
+Presupuesto 200 USD   ████████████████████░░░░ quedan 36.73 USD (gastado el 82 %)
+Tanque de contexto    ███████████████████░░░░░ queda libre el 21 % · ocupados 786k de 1.0M
+Ritmo (última hora)   ▂▃▅▇▆▃▂▁▁▂▃▂ 28.4 USD/h
+Autonomía             1 h 17 min hasta el presupuesto, al ritmo actual
 
-Avance real · dueno/repositorio · desde el 07-09 · 14:48
-Issues: 188 cerradas · 10 descartadas · 216 creadas · 18 abiertas hoy
-Factura de 238 USD: este proyecto ≈ 112 USD (47 %) · ≈ 0.60 USD por issue cerrada
-28-09  55 cerradas ·  74 creadas ·  51 abiertas · ███░░░░░  41 USD
-05-10  56 cerradas ·  28 creadas ·  18 abiertas · ██░░░░░░  22 USD
-Iteración: 68 despertares del bucle, 23 sin cambios · 130 subagentes (38.7 % del consumo)
+2 · ¿Esta semana se cierra trabajo o sólo se gasta? · Avance real · acme/plataforma
+Sólo se gasta. Esta semana: ≈ 11 USD de consumo y ninguna issue cerrada (21 creadas)
+Issues: 132 cerradas · 5 descartadas · 209 creadas · 72 abiertas hoy
 
-Orquestación · 2 agentes externos (1 activos) · 8 subagentes de la sesión (1 activos)
-activo   agy      #345 · 3 commits · última actividad hace 2 min
-FUERA    codex    #344 · 5 commits · sin cuota · reasignada a claude
-Por redistribuir: #314 (su agente está inactivo o fuera y nadie las tomó)
+3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar? · decidido 15:04
+Esta sesión tiene la #333 (Cierre), peso L, esfuerzo muy alto, modelo opus. El próximo despertar sigue con ella y no toma otra.
+Agy tiene la #346 (Construcción), peso M, esfuerzo alto, modelo opus. El próximo despertar la deja donde está si la rama agy/346 se movió en los últimos 30 minutos; si no, la marca por retomar.
+En cola: #342, #343. Espera al dueño: #325.
 ```
 
 ## Integrarlo a tu repositorio en cinco pasos
@@ -60,8 +57,7 @@ después guarda la última medición y la enseña al abrir la sesión.
 
 ### Si trabajas con más de un agente
 
-Para que la sección «Orquestación» sepa quién hace qué, basta una convención y, opcionalmente, un
-fichero:
+Para que el control sepa quién hace qué, basta una convención y un fichero:
 
 - Cada agente trabaja en su propia rama con la forma **`agente/número-de-issue`** (`codex/344`,
   `agy/345`), idealmente en su propio `git worktree`. El mod deduce de ahí quién es, en qué issue está y
@@ -70,52 +66,41 @@ fichero:
   escribe en `.claude/orquestacion.json`, en la raíz de tu repositorio. Hay una plantilla en
   [`ejemplos/orquestacion.json`](ejemplos/orquestacion.json).
 
-### Qué mirar cada semana
+### Qué hace el control cuando despierta
 
-| Señal en el tablero | Qué significa | Qué hacer |
-|---|---|---|
-| «Esta semana: ≈ N USD de consumo y ninguna issue cerrada» (en rojo) | Se gastó y no se cerró nada | Revisar qué quedó a medias: suele ser trabajo hecho y sin cerrar, o iteración sin salida |
-| «El tablero no se vacía, crece» | Se abren más issues de las que se cierran | Dejar de abrir, o partir menos fino |
-| «N despertares del bucle, M sin cambios» con M alto | El bucle despierta para no hacer nada | Espaciar los despertares o dejar que avise el trabajo en segundo plano |
-| «subagentes (X % del consumo)» muy alto | Se delega más de lo que rinde | Delegar sólo lo que se puede describir bien |
-| «releer contexto X %» muy alto | Sesiones largas que releen su historia | Cerrar la sesión al cambiar de tema |
-| «Por redistribuir: #N» (en rojo) | Una issue tiene dueño inactivo o fuera | Reasignarla y anotarlo en `.claude/orquestacion.json` |
+En `session.start` y en cada despertar del bucle (`/loop`), antes de que nadie empiece, el hook:
 
-## Qué mide
+1. **Lee** las issues abiertas del repositorio (con `scripts/gh-vt.ps1` del propio repositorio), qué commits
+   de `main` nombran cada una, la rama `agente/número` de cada trabajador externo y `.claude/orquestacion.json`.
+2. **Clasifica** cada issue en una sola clase: Cierre, Construcción, Interina, Decisión o Épica. Una Decisión
+   (`P-*`, `decision-humana`) no se asigna: queda «espera al dueño». Una épica no lleva modelo.
+3. **Pesa lo que falta**, no la issue entera. Un punto por cada sí: más de una capa; migración, RLS, permisos,
+   sesión o datos personales; la causa no está escrita; hace falta navegador, `pnpm e2e` o `pnpm gate`; toca
+   producción o una puerta.
+4. **Asigna, reasigna o se detiene**, y lo escribe en `.claude/orquestacion.json`:
 
-| Sección | Qué dice | De dónde sale |
-|---|---|---|
-| **Consumo** | Duración de la sesión, costo según el motor y estimado, contexto ocupado, presupuesto gastado, ritmo de la última hora y autonomía al ritmo actual | La transcripción de la sesión y `$.session.usage()` |
-| **Avance real** | Issues cerradas, creadas y abiertas por semana; qué parte de la factura mensual consume este proyecto; costo por issue cerrada; proyección de cuándo se vacía el tablero; despertares de bucle vacíos y peso de los subagentes | Todas las transcripciones de `~/.claude/projects` y `gh issue list` |
-| **Orquestación** | Qué agentes trabajan en el repositorio, en qué issue, cuál está activo, inactivo o fuera, y qué issues quedaron sin dueño | `git worktree`, ramas `agente/issue` y `.claude/orquestacion.json` |
-| **Ahora** | La tarea en curso y el próximo despertar del bucle | La transcripción |
-| **Pendiente en GitHub** | Issues y PR abiertos | `gh` |
-| **Por modelo / Tareas anteriores** | Llamadas, tokens y costo estimado por modelo, por tarea y por subagente | La transcripción y las de sus subagentes |
-| **Cobertura** | Porcentaje de `pytest --cov`; se oculta donde no hay pytest | `coverage` |
+| Puntos | Peso | Esfuerzo | Modelo | Quién lo hace |
+|---|---|---|---|---|
+| 0 | XS | bajo | haiku | esta sesión |
+| 1 | S | medio | sonnet | esta sesión |
+| 2 | M | alto | el de la sesión | esta sesión, o Agy si esta sesión está desplegando |
+| 3 | L | muy alto | el de la sesión | Claude construye; Agy o Codex, el que esté libre, revisa en sólo lectura |
+| 4–5 | XL | máximo, con plan antes | el de la sesión | no se asigna entera: se parte en pesos L o M |
 
-### Cómo leer las cifras
+Reglas que el control no negocia:
 
-- **«Estimado» es precio de lista**, calculado desde los tokens de la transcripción; «motor» es lo que
-  informa Claude Code. Ninguno es la factura.
-- **La parte de la factura es un reparto, no una medición de cobro:** el consumo de todos los proyectos
-  de la máquina se pondera por modelo y la factura mensual configurada se reparte en esa proporción.
-- **Un mismo mensaje aparece en varias líneas de la transcripción** con el mismo uso. Se cuenta una vez
-  por `message.id`; sin eso el total se infla unas 2,7 veces.
-- **«Issues cerradas» no distingue tamaño.** Sirve para ver tendencia y semanas con consumo y sin
-  cierres, no para comparar personas.
+- **Un trabajador, una issue.** Una asignación vigente no se reasigna.
+- Un trabajador externo que lleva **más de 30 minutos sin mover su rama** `agente/número` pasa a «por
+  retomar», y el siguiente despertar se la da al siguiente que esté libre.
+- Quien está en `fuera` no recibe nada, y el motivo queda a la vista.
+- Agy trabaja en `<raíz>-agy`, rama `agy/<número>`; Codex en `<raíz>-codex`, rama `codex/<número>`. Reciben
+  un encargo cerrado: número, criterio de aceptación y archivos que no pueden tocar.
+- Empujar `main`, migrar producción y desplegar el API no se delegan.
+- Si `.vt-suite.lock` está tomado, el control lo dice y no lanza `verify`, `gate` ni `e2e`.
+- Si GitHub no responde, lo dice y enruta sólo la cola escrita; no pesa a ciegas ni da nada por cerrado.
 
-## Requisitos
-
-- Claude Code con soporte de mods (plugins de hooks).
-- `python` 3.10 o superior en el `PATH` (o un `.venv` en la raíz del proyecto).
-- `git`, y `gh` autenticado con acceso al repositorio que se mide.
-
-## Instalación
-
-```
-/plugin marketplace add cherrera0001/claude-code-mod-consumo
-/plugin install consumo@consumo-local
-```
+La decisión llega a quien trabaja por dos sitios: el fichero, y una sección del prompt de sistema que
+repite la orden vigente. El control sólo actúa en un repositorio que tenga `.claude/orquestacion.json`.
 
 Reinicia Claude Code. El panel se abre solo en terminales anchas; en cualquier ancho, con `/consumo`.
 
@@ -125,9 +110,11 @@ Para desarrollarlo desde una copia local: `claude --plugin-dir <carpeta de este 
 
 | Comando | Qué hace |
 |---|---|
-| `/consumo` | Abre el panel y devuelve el resumen de la sesión |
+| `/consumo` | Pinta el panel y devuelve el resumen de la sesión |
 | `/consumo avance` | Vuelve a medir issues cerradas y parte de la factura (tarda medio minuto) |
-| `/consumo agentes` | Quién trabaja en el repositorio y qué hay que redistribuir |
+| `/consumo agentes` | Ejecuta el control y responde con una frase por issue: quién, número, peso, modelo y qué hará el próximo despertar |
+| `/consumo fuera <agy\|codex> <motivo>` | Saca a ese trabajador y mueve su issue |
+| `/consumo tomar <número> <agy\|codex\|claude>` | Reasigna a mano y lo anota en la issue con una línea |
 | `/consumo github` | Relee issues y PR abiertos |
 | `/consumo cobertura` | Corre `pytest --cov` (sólo donde hay pytest) |
 
@@ -142,20 +129,22 @@ Se pide al instalar y se cambia en `/plugin`:
 | `repo` | `dueño/nombre` del repositorio de issues | el remoto `origin` |
 | `cuentaGitHub` | Cuenta de `gh` con la que se consulta | la dueña del repositorio |
 
-## Orquestación entre agentes
+## El fichero del control
 
-El mod reconoce a un agente externo por su rama: `codex/344`, `agy/345`. Deduce de `git` si sigue
-activo (último commit o fichero tocado hace menos de 30 minutos). Lo que `git` no puede saber se
-declara en `.claude/orquestacion.json`, en el repositorio que se mide:
+`.claude/orquestacion.json`, en la raíz del repositorio de trabajo, es donde el control escribe y donde
+se le dice lo que `git` y GitHub no saben. Plantilla: [`ejemplos/orquestacion.json`](ejemplos/orquestacion.json).
 
-```json
-{
-  "fuera": { "codex": "sin cuota de tokens desde el 07-10" },
-  "reasignado": { "344": "claude", "314": "claude" }
-}
-```
+| Clave | Quién la escribe | Qué es |
+|---|---|---|
+| `cola` | tú | El orden en que se toman las issues |
+| `fuera` | tú o `/consumo fuera` | Trabajador → motivo |
+| `declarado` | tú | Por issue: `clase`, `falta`, `solo_sesion` y las cinco respuestas del peso |
+| `no_tocar` | tú | Archivos que un trabajador externo no puede tocar |
+| `asignaciones` | el control | Issue → trabajador, clase, peso, esfuerzo, modelo, estado y encargo |
+| `clasificacion` | el control | Todas las issues leídas, con su situación |
+| `router` | el control | Si GitHub respondió y qué anotaciones quedaron pendientes |
 
-Una issue cuyo agente está inactivo o fuera, y que nadie reasignó, sale en rojo como «por redistribuir».
+El fichero sólo se reescribe cuando la decisión cambia.
 
 ## Privacidad
 
