@@ -33,7 +33,10 @@ export type Declarado = Partial<Criterios> & {
   criterio?: string
   /** Los archivos que el trabajo toca. */
   archivos?: string[]
-  /** Lo que sólo el dueño puede destrabar (una credencial, una decisión). Mientras esté escrito, el despertar para. */
+  /**
+   * Lo que sólo el dueño puede destrabar (una credencial, una decisión). Mientras esté escrito, la issue sigue
+   * siendo de quien la tiene pero no lo ocupa: el control le da la siguiente de la cola.
+   */
   espera?: string
 }
 
@@ -93,6 +96,8 @@ export type Estado = {
   asignaciones?: Record<string, Asignacion>
   clasificacion?: Fila[]
   router?: { github: string; issues_abiertas: number | null; pendientes?: string[] }
+  /** Dónde publica el servicio su salud (commit y estado). Sólo de ahí sale la ficha pública de producción. */
+  produccion?: { salud?: string }
   [otra: string]: unknown
 }
 
@@ -233,6 +238,9 @@ export type Salida = { filas: Fila[]; asignaciones: Record<string, Asignacion>; 
  *  3. Un trabajador, una issue (construir o hacer el CONTRA lo ocupa por igual).
  *  4. Decisión: nadie; «espera al dueño». Épica e Interina: sin modelo ni trabajador. XL: no se asigna entera.
  *  5. Lo que toca producción o está marcado `solo_sesion` sólo lo construye esta sesión.
+ *  6. Una asignación cuya issue tiene `espera` escrito no ocupa a nadie: sigue siendo de su trabajador y sigue
+ *     a la vista, pero ni él ni su revisor quedan retenidos y la cola no se detiene detrás de ella. Tampoco pasa a
+ *     «por retomar» por falta de actividad: no hay nada que mover mientras el dueño no la destrabe.
  */
 export function enrutar(e: Entrada): Salida {
   const fuera = Object.fromEntries(Object.entries(e.estado.fuera ?? {}).map(([k, v]) => [k.toLowerCase(), String(v)]))
@@ -264,13 +272,16 @@ export function enrutar(e: Entrada): Salida {
     // Recién asignada todavía no hay rama: los 30 minutos corren desde lo último entre el encargo y la rama.
     const desdeEncargo = (Date.parse(e.ahora) - Date.parse(previa.desde)) / 60_000
     const enRama = act && act.issue === numero ? act.hace_min : Number.POSITIVE_INFINITY
-    const parado = quien !== 'claude' && !(Math.min(enRama, Number.isFinite(desdeEncargo) ? desdeEncargo : Number.POSITIVE_INFINITY) <= INACTIVO_MIN)
+    const enEspera = Boolean(declarado[clave]?.espera)
+    const parado = !enEspera && quien !== 'claude' && !(Math.min(enRama, Number.isFinite(desdeEncargo) ? desdeEncargo : Number.POSITIVE_INFINITY) <= INACTIVO_MIN)
     const contra = previa.contra && !fuera[previa.contra] ? previa.contra : undefined
     asignaciones[clave] = parado
       ? { ...previa, contra, estado: 'por retomar', motivo: act && act.issue === numero ? `sin actividad en ${act.rama} hace ${Math.round(act.hace_min)} min` : `sin rama ${quien}/${numero} a la vista` }
       : { ...previa, contra }
-    ocupado.set(quien, numero)
-    if (contra) ocupado.set(contra, numero)
+    if (!enEspera) {
+      ocupado.set(quien, numero)
+      if (contra) ocupado.set(contra, numero)
+    }
     if (parado) avisos.push(`#${numero} pasa a «por retomar» (${asignaciones[clave]!.motivo}); el siguiente router la reasigna.`)
   }
 
@@ -352,15 +363,18 @@ export function enrutar(e: Entrada): Salida {
       continue
     }
 
+    // Regla 6: la que espera al dueño se anota a su trabajador, pero no lo ocupa ni retiene a un revisor.
+    const enEspera = Boolean(d?.espera)
+    if (enEspera) motivo = `${motivo}; espera al dueño y no ocupa a ${quien}`
     const nueva: Asignacion = { trabajador: quien, clase, puntos, peso: t.peso, esfuerzo: t.esfuerzo, estado: 'vigente', desde: e.ahora, motivo }
-    ocupado.set(quien, numero)
+    if (!enEspera) ocupado.set(quien, numero)
     if (quien !== 'claude') {
       nueva.arbol = arbol(e.raiz, quien)
       nueva.rama = `${quien}/${numero}`
       nueva.encargo = encargo(i, quien, 'construir', noTocar, e.raiz)
     }
     // Lo reservado a esta sesión no se reabre: no se le busca revisor.
-    if (t.peso === 'L' && !d?.solo_sesion) {
+    if (t.peso === 'L' && !d?.solo_sesion && !enEspera) {
       const lector = EXTERNOS.find(x => x !== quien && libre(x))
       if (lector) {
         nueva.contra = lector
@@ -377,7 +391,7 @@ export function enrutar(e: Entrada): Salida {
   return { filas, asignaciones, avisos }
 }
 
-const NOMBRE: Record<Trabajador, string> = { claude: 'Esta sesión', agy: 'Agy', codex: 'Codex' }
+export const NOMBRE: Record<Trabajador, string> = { claude: 'Esta sesión', agy: 'Agy', codex: 'Codex' }
 
 /** Qué hará el próximo despertar con una asignación: seguir, reasignar o esperar. Es la orden, no un estado. */
 export function proximo(a: Asignacion): string {
@@ -387,9 +401,14 @@ export function proximo(a: Asignacion): string {
 }
 
 /** Una frase por issue asignada: quién, qué número, qué peso y qué hará el próximo despertar. */
-export function frases(s: Salida, parada?: { parar: boolean; numero: number | null }): string[] {
+export function frases(s: Salida, parada?: { parar: boolean; numero: number | null }, declarado?: Record<string, Declarado>): string[] {
   const salida: string[] = []
   for (const [clave, a] of Object.entries(s.asignaciones)) {
+    const espera = declarado?.[clave]?.espera
+    if (espera) {
+      salida.push(`${NOMBRE[a.trabajador]} tiene la #${clave} (${a.clase}), peso ${a.peso}, pero espera al dueño: ${espera}. No lo ocupa: el control sigue con la siguiente de la cola.`)
+      continue
+    }
     const contra = a.contra ? `; ${NOMBRE[a.contra]} la revisa en sólo lectura` : a.sin_contra ? `; nadie libre para revisarla (${a.sin_contra})` : ''
     const retomar = a.estado === 'por retomar' ? ` Por retomar: ${a.motivo}.` : ''
     salida.push(`${NOMBRE[a.trabajador]} tiene la #${clave} (${a.clase}), peso ${a.peso}, esfuerzo ${a.esfuerzo}${contra}.${retomar} ${parada?.parar && parada.numero === Number(clave) ? 'El próximo despertar para: no le queda un paso que se pueda dar' : proximo(a)}.`)
@@ -400,11 +419,18 @@ export function frases(s: Salida, parada?: { parar: boolean; numero: number | nu
 
 /**
  * La orden del próximo despertar de esta sesión: la issue que tiene, su primer paso sin hacer, el criterio y los
- * archivos. Sale del fichero y de nada más. El paso no se inventa: sin `declarado[n].pasos`, o con todos hechos,
+ * archivos (la primera de la cola que no espere al dueño). Sale del fichero y de nada más. El paso no se inventa: sin `declarado[n].pasos`, o con todos hechos,
  * la orden es parar. Es lo único que llega al modelo cuando el bucle despierta.
  */
 export function orden(estado: Estado): { texto: string; parar: boolean; numero: number | null; paso: string | null } {
-  const mia = Object.entries(estado.asignaciones ?? {}).find(([, a]) => a.trabajador === 'claude' && a.estado === 'vigente')
+  // Las vigentes de esta sesión, en el orden de la cola (las claves numéricas de un objeto salen por número, no
+  // por cola). La orden es la de la primera que no espere al dueño; si todas esperan, se para con el motivo.
+  const cola = estado.cola ?? []
+  const lugar = (n: string): number => (cola.indexOf(Number(n)) < 0 ? cola.length : cola.indexOf(Number(n)))
+  const mias = Object.entries(estado.asignaciones ?? {})
+    .filter(([, a]) => a.trabajador === 'claude' && a.estado === 'vigente')
+    .sort(([a], [b]) => lugar(a) - lugar(b) || Number(a) - Number(b))
+  const mia = mias.find(([n]) => !estado.declarado?.[n]?.espera) ?? mias[0]
   const cierre = 'No recorras el tablero ni abras issues: termina el bucle (ScheduleWakeup con stop) y dilo en una línea.'
   if (!mia) return { texto: `Orden: parar. Esta sesión no tiene una asignación vigente. ${cierre}`, parar: true, numero: null, paso: null }
   const numero = Number(mia[0])

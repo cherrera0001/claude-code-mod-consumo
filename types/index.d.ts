@@ -160,7 +160,10 @@ export type Avance = {
   proyecto: ProyectoAvance | null
   repo: RepoAvance | null
   semanas: SemanaAvance[]
-  reparto: { nombre: string; pct: number; usd: number }[]
+  /** Los proyectos de esta máquina que entran en el reparto. `raiz`: su carpeta, o '' si no se pudo deducir. */
+  reparto: { nombre: string; pct: number; usd: number; raiz?: string }[]
+  /** Ruta del index de tareas (privado) que se escribió al medir, o '' si no se escribió. */
+  index: string
 }
 
 /** La última decisión del control, en frases: quién tiene cada issue y qué hará el próximo despertar. */

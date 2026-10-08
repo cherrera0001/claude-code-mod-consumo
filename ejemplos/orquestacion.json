@@ -1,5 +1,5 @@
 {
-  "_nota": "Fichero del control de consumo 2.0. Tú escribes cola, fuera, declarado y no_tocar; el control escribe asignaciones, clasificacion y router.",
+  "_nota": "Fichero del control de consumo 2.0. Tú escribes cola, fuera, declarado, no_tocar y produccion; el control escribe asignaciones, clasificacion y router.",
   "cola": [
     101,
     102,
@@ -37,5 +37,8 @@
   "no_tocar": [
     "definicion/",
     ".env"
-  ]
+  ],
+  "produccion": {
+    "salud": "https://ejemplo.invalid/health"
+  }
 }

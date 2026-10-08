@@ -19,6 +19,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 # Peso por millon de tokens (entrada, salida). Sirve para REPARTIR la factura entre proyectos; no es un precio.
 PESOS = (("fable", 10.0, 50.0), ("opus", 4.0, 20.0), ("sonnet", 2.0, 10.0), ("haiku", 1.0, 5.0))
 CADUCA_S = 20 * 60
+# Version de la forma de la salida: una cache escrita por otra version no se reutiliza.
+VERSION = 2
 FORMATO = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -50,7 +52,7 @@ def lunes(iso):
 
 def nuevo():
     return {"sesiones": 0, "prompts": 0, "llamadas": 0, "peso": 0.0, "peso_sub": 0.0, "peso_relectura": 0.0,
-            "despertares": 0, "vacios": 0, "agentes": 0, "semanas": {}}
+            "despertares": 0, "vacios": 0, "agentes": 0, "semanas": {}, "raices": set()}
 
 
 def leer(ruta, desde_iso, p, es_sub, detalle):
@@ -78,6 +80,9 @@ def leer(ruta, desde_iso, p, es_sub, detalle):
             if r.get("type") == "assistant" and isinstance(m.get("usage"), dict):
                 # un mismo mensaje sale en varias lineas (una por bloque): gana la ultima
                 mensajes[m.get("id") or r.get("uuid")] = (str(m.get("model") or "?"), m["usage"], t)
+                # la carpeta en que corria la sesion: de ahi sale la raiz del proyecto para el index
+                if not es_sub and isinstance(r.get("cwd"), str) and r.get("cwd"):
+                    p["raices"].add(r["cwd"])
                 if not detalle:
                     continue
                 for b in m.get("content") or []:
@@ -106,6 +111,13 @@ def leer(ruta, desde_iso, p, es_sub, detalle):
         k = lunes(t)
         p["semanas"][k] = p["semanas"].get(k, 0.0) + w
     return bool(mensajes)
+
+
+def raiz_de(clave, p):
+    # La raiz del proyecto: la carpeta mas corta, de las que sus sesiones usaron, cuya clave es la del proyecto
+    # (un worktree comparte la clave y es mas largo). Con barras normales; vacia si ninguna coincide.
+    propias = sorted((c for c in p["raices"] if clave_de(c) == clave), key=lambda c: (len(c), c))
+    return propias[0].replace(os.sep, "/").rstrip("/") if propias else ""
 
 
 def repo_de(raiz):
@@ -162,7 +174,7 @@ def main():
         try:
             if previa or time.time() - os.path.getmtime(cache) < CADUCA_S:
                 previo = json.load(open(cache, encoding="utf-8"))
-                if (previo.get("dias") == dias and previo.get("factura") == factura
+                if (previo.get("version") == VERSION and previo.get("dias") == dias and previo.get("factura") == factura
                         and (previo.get("repo") or {}).get("nombre") == repo):
                     print(json.dumps(dict(previo, de_cache=True), ensure_ascii=False))
                     return
@@ -207,7 +219,7 @@ def main():
     if total > 0:
         for k, p in sorted(proyectos.items(), key=lambda kv: -kv[1]["peso"])[:5]:
             if p["peso"] > 0:
-                reparto.append({"nombre": re.sub("^[a-z]--(code-)?", "", k) or k,
+                reparto.append({"nombre": re.sub("^[a-z]--(code-)?", "", k) or k, "raiz": raiz_de(k, p),
                                 "pct": round(100 * p["peso"] / total, 1), "usd": round(p["peso"] / total * factura, 2)})
 
     info = {"nombre": repo, "via": "", "error": "", "abiertas": 0, "creadas": 0, "hechas": 0, "descartadas": 0,
@@ -246,6 +258,9 @@ def main():
         info["usd_por_issue"] = round(proyecto["usd_factura"] / info["hechas"], 2)
 
     salida = {
+        "version": VERSION,
+        # Donde el mod deja el index: en la carpeta del usuario, fuera de cualquier repositorio.
+        "carpeta_index": os.path.join(os.path.dirname(base), "consumo-index").replace(os.sep, "/"),
         "ahora": ahora.timestamp(), "desde": desde.strftime("%Y-%m-%d"), "dias": dias, "factura": factura,
         "proyectos_con_actividad": sum(1 for p in proyectos.values() if p["peso"] > 0),
         "proyecto": proyecto, "repo": info, "semanas": semanas, "reparto": reparto, "de_cache": False,

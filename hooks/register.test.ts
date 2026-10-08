@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const props = { title: 'Consumo', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as const
 const viewport = { columns: 160, rows: 64, isFullscreen: true }
@@ -93,7 +93,17 @@ test('con una medición, el avance real muestra cierres, factura y la semana sin
 // la prueba: el disco (.claude/orquestacion.json), git y el envoltorio de GitHub del repositorio.
 type IssueDePrueba = { number: number; title: string; labels: { name: string }[]; body: string; projectItems: unknown[] }
 
-function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Record<string, unknown>): { escrito: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void } {
+// `extra.medicion`: lo que contesta la medición de avance (si no, falla, como en una máquina sin Python).
+// `extra.salud`: lo que contesta la URL de salud a curl. Lo que no es el fichero del control (el index) queda
+// en `archivos()`, por ruta.
+function repositorioDePrueba(
+  on: unknown,
+  issues: IssueDePrueba[],
+  estado: Record<string, unknown>,
+  extra: { medicion?: unknown; salud?: string } = {},
+): { escrito: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[] } {
+  const otros: Record<string, string> = {}
+  const urls: string[] = []
   const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string }) => unknown) => void
   let guardado = JSON.stringify(estado)
   let entrado = ''
@@ -115,7 +125,9 @@ function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Recor
   })
   contestar('fs.read', () => ({ value: guardado }))
   contestar('fs.write', (_$, e) => {
-    guardado = String(e.text)
+    if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
+    // El motor entrega la ruta con las barras del sistema; aquí se guardan con barras normales.
+    else otros[String(e.path).replace(/\\/g, '/')] = String(e.text)
     return { value: undefined }
   })
   contestar('process.run', (_$, e) => {
@@ -123,9 +135,16 @@ function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Recor
     if (argv.some(a => a.endsWith('gh-vt.ps1')) && argv.includes('list')) return { value: { exitCode: 0, stdout: JSON.stringify(issues), stderr: '' } }
     if (argv[0] === 'git' && argv.includes('remote')) return { value: { exitCode: 0, stdout: 'https://github.com/acme/plataforma.git', stderr: '' } }
     if (argv[0] === 'git' && argv.includes('log') && argv.includes('main')) return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    if (extra.medicion && argv.includes('--factura') && !argv.includes('--previa')) return { value: { exitCode: 0, stdout: JSON.stringify(extra.medicion), stderr: '' } }
+    if (extra.salud !== undefined && argv[0] === 'curl') {
+      urls.push(String(argv[argv.length - 1]))
+      return { value: { exitCode: 0, stdout: extra.salud, stderr: '' } }
+    }
     return { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } }
   })
   return {
+    archivos: () => otros,
+    pedidas: () => urls,
     escrito: () => JSON.parse(guardado),
     poner: e => {
       guardado = JSON.stringify(e)
@@ -300,4 +319,210 @@ test('recién abierta y sin pytest: ni error de transcripción ni sección de co
   expect(await pane.find({ text: /Cobertura de pruebas/ })).toBeUndefined()
   expect(await pane.find({ type: 'Button', text: /pytest/ })).toBeUndefined()
   expect(await pane.find({ type: 'Button', text: /Avance/ })).toBeDefined()
+})
+
+// ── Regla del router: la que espera al dueño no ocupa a su trabajador ───────────────────────────────
+test('con la primera issue en espera, la sesión recibe la siguiente de la cola y la orden es la de esa siguiente', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(101, 'Publicar un cierre'), issue(102, 'Ajustar un formulario'), issue(103, 'Cambiar una etiqueta')], {
+    cola: [101, 102, 103],
+    declarado: {
+      '101': { capas: false, espera: 'falta una credencial vigente', pasos: [{ paso: 'publicar el cierre', hecho: false }] },
+      '102': { capas: false, pasos: [{ paso: 'ajustar el campo del formulario', hecho: false }], criterio: 'el formulario valida el campo' },
+    },
+  })
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('Orden: issue #102.')
+  expect(repo.entro()).toContain('Siguiente paso: ajustar el campo del formulario')
+  expect(repo.entro()).not.toContain('publicar el cierre')
+  expect(repo.entro()).not.toContain('parar')
+  // La que espera sigue siendo suya y sigue a la vista; la tercera queda detrás de la que sí ocupa.
+  const escrito = repo.escrito()
+  expect(escrito.asignaciones['101'].trabajador).toBe('claude')
+  expect(escrito.asignaciones['101'].estado).toBe('vigente')
+  expect(escrito.asignaciones['102'].trabajador).toBe('claude')
+  expect(escrito.asignaciones['103']).toBeUndefined()
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('Esta sesión tiene la #101')
+  expect(respuesta).toContain('espera al dueño: falta una credencial vigente')
+  expect(respuesta).toContain('Esta sesión tiene la #102')
+  expect(respuesta).toContain('En cola: #103')
+})
+
+// ── El index ────────────────────────────────────────────────────────────────────────────────────────
+// Se genera al medir el avance: «/consumo avance» por su camino real. La medición de la prueba trae el reparto
+// con la raíz de cada proyecto y la carpeta del index, como la da el guion de avance.
+const CARPETA_INDEX = 'C:/Users/prueba/.claude/consumo-index'
+const medicionConReparto = (reparto: unknown[]) => ({
+  version: 2,
+  carpeta_index: CARPETA_INDEX,
+  desde: '2026-08-31',
+  factura: 238,
+  proyecto: { clave: 'f--proyecto', sesiones: 3, prompts: 20, llamadas: 400, pct_del_total: 80, usd_factura: 190.4, pct_subagentes: 10, pct_relectura: 70, despertares: 4, despertares_vacios: 1, agentes: 2 },
+  repo: { nombre: 'acme/plataforma', via: 'cuenta acme', error: '', abiertas: 2, creadas: 5, hechas: 3, descartadas: 0, usd_por_issue: 63.47 },
+  semanas: [],
+  reparto,
+})
+const ACME = { nombre: 'acme', pct: 80, usd: 190.4, raiz: 'F:/proyecto' }
+const FOTO = '2026-05-28 20:26 UTC'
+
+test('el index de un proyecto sin pasos dice «no hay paso» y no incluye títulos de issues', async ($, on) => {
+  mock.store(on)
+  const repo = repositorioDePrueba(
+    on,
+    [issue(7001, 'Zanahoria reconocible en el titulo'), issue(7002, 'Berenjena reconocible en la cola')],
+    { cola: [7001, 7002] },
+    { medicion: medicionConReparto([ACME, { nombre: 'otro', pct: 20, usd: 47.6 }]) },
+  )
+  // El control decide primero: el fichero queda con asignaciones y con la clasificación, que sí lleva títulos.
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(JSON.stringify(repo.escrito())).toContain('Zanahoria')
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'avance' } as never))
+  expect(respuesta).toContain(`Index: ${CARPETA_INDEX}/index.html`)
+  const html = repo.archivos()[`${CARPETA_INDEX}/index.html`]!
+  const json = repo.archivos()[`${CARPETA_INDEX}/index.json`]!
+  expect(html).toContain('no hay paso')
+  expect(html).toContain('#7001')
+  expect(html).toContain('Esta sesión')
+  expect(html).toContain('sin control')
+  expect(html).not.toContain('<script')
+  for (const salida of [html, json]) {
+    expect(salida).not.toContain('Zanahoria')
+    expect(salida).not.toContain('Berenjena')
+    expect(salida).not.toContain('reconocible')
+    // La cola no se repite: la segunda issue, que sólo está en cola, no sale.
+    expect(salida).not.toContain('7002')
+  }
+  const fichas = JSON.parse(json).fichas
+  expect(fichas[0]).toEqual({ nombre: 'acme', control: true, issue: 7001, quien: 'Esta sesión', paso: 'no hay paso', despertar: 'sin despertares registrados', despertar_cuando: null, foto: FOTO })
+  expect(fichas[1]).toEqual({ nombre: 'otro', control: false, estado: 'sin control', foto: FOTO })
+  // Sin `produccion.salud` declarado no hay ficha pública.
+  expect(Object.keys(repo.archivos()).some(ruta => ruta.includes('produccion-'))).toBe(false)
+})
+
+test('la ficha pública de producción sólo tiene commit y salud, aunque el estado tenga issues, pasos, nombres y cola', async ($, on) => {
+  mock.store(on)
+  const repo = repositorioDePrueba(
+    on,
+    [issue(7001, 'Zanahoria reconocible en el titulo'), issue(7002, 'Berenjena reconocible en la cola')],
+    {
+      cola: [7001, 7002],
+      fuera: { codex: 'sin cuota' },
+      declarado: { '7001': { capas: false, pasos: [{ paso: 'retirar el remolino', hecho: false }], criterio: 'ya no gira' } },
+      produccion: { salud: 'https://ejemplo.invalid/health' },
+    },
+    { medicion: medicionConReparto([ACME]), salud: JSON.stringify({ status: 'ok', commit: 'abcdef1234', interno: 'no debe salir' }) },
+  )
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  await $.command.run({ command: 'consumo', args: 'avance' } as never)
+  expect(repo.pedidas()).toEqual(['https://ejemplo.invalid/health'])
+  // El estado sí los tiene, y el index privado los enseña: lo que sigue no pasa por casualidad.
+  const privado = repo.archivos()[`${CARPETA_INDEX}/index.html`]!
+  expect(privado).toContain('#7001')
+  expect(privado).toContain('retirar el remolino')
+  expect(privado).toContain('Esta sesión')
+  const html = repo.archivos()[`${CARPETA_INDEX}/produccion-acme.html`]!
+  const json = repo.archivos()[`${CARPETA_INDEX}/produccion-acme.json`]!
+  expect(html).toContain('abcdef1234')
+  expect(html).toContain('<dd>bien</dd>')
+  expect(html).not.toContain('<script')
+  expect(JSON.parse(json)).toEqual({ commit: 'abcdef1234', bien: true, foto: FOTO })
+  for (const salida of [html, json]) {
+    for (const prohibido of ['7001', '7002', 'retirar', 'remolino', 'ya no gira', 'Zanahoria', 'Berenjena', 'Esta sesión', 'claude', 'Agy', 'agy', 'Codex', 'codex', 'sin cuota', 'cola', 'issue', 'paso', 'acme', 'interno', 'ejemplo.invalid']) {
+      expect(salida).not.toContain(prohibido)
+    }
+  }
+})
+
+test('el index dice qué hizo el último despertar: dio una orden y, marcado el paso, cerró algo', async ($, on) => {
+  mock.store(on)
+  const repo = repositorioDePrueba(
+    on,
+    [issue(346, 'Ajustar un formulario')],
+    conPasos([{ paso: 'retirar el botón', hecho: false }, { paso: 'medir en el navegador', hecho: false }]),
+    { medicion: medicionConReparto([ACME]) },
+  )
+  const fichaDeAcme = async () => {
+    await $.command.run({ command: 'consumo', args: 'avance' } as never)
+    return JSON.parse(repo.archivos()[`${CARPETA_INDEX}/index.json`]!).fichas[0]
+  }
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('Siguiente paso: retirar el botón')
+  let f = await fichaDeAcme()
+  expect(f.despertar).toBe('dio una orden')
+  expect(f.paso).toBe('retirar el botón')
+  expect(f.issue).toBe(346)
+  // Alguien marca el paso; el siguiente despertar encuentra un paso hecho más que el anterior.
+  const fichero = repo.escrito()
+  fichero.declarado['346'].pasos[0].hecho = true
+  repo.poner(fichero)
+  await despertar($, repo.entro())
+  f = await fichaDeAcme()
+  expect(f.despertar).toBe('cerró algo')
+  expect(f.paso).toBe('medir en el navegador')
+  expect(repo.archivos()[`${CARPETA_INDEX}/index.html`]).toContain('cerró algo')
+  // Un despertar más sin que nadie marque nada ya no «cerró algo»: vuelve a ser una orden.
+  await despertar($, repo.entro())
+  f = await fichaDeAcme()
+  expect(f.despertar).toBe('dio una orden')
+  // El registro no se escribe en el fichero versionado.
+  expect(JSON.stringify(repo.escrito())).not.toContain('pasosHechos')
+})
+
+test('un despertar sin pasos queda en el index como «paró»', async ($, on) => {
+  mock.store(on)
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { medicion: medicionConReparto([ACME]) })
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('parar')
+  await $.command.run({ command: 'consumo', args: 'avance' } as never)
+  const f = JSON.parse(repo.archivos()[`${CARPETA_INDEX}/index.json`]!).fichas[0]
+  expect(f.despertar).toBe('paró')
+  expect(f.paso).toBe('no hay paso')
+  expect(f.despertar_cuando).toBe(FOTO)
+})
+
+// ── Leer GitHub cuando el envoltorio del repositorio no responde ─────────────────────────────────────
+function sinEnvoltorio(on: unknown, identidad: string): { escrito: () => any } {
+  const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string; env?: Record<string, string> }) => unknown) => void
+  let guardado = JSON.stringify({ cola: [346] })
+  const bien = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
+  contestar('ui.open', () => ({ value: undefined }))
+  contestar('clock.now', () => ({ value: 1_780_000_000_000 }))
+  contestar('session.id', () => ({ value: 'sesion' }))
+  contestar('session.cwd', () => ({ value: 'F:/proyecto' }))
+  contestar('session.root', () => ({ value: 'F:/proyecto' }))
+  contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
+  contestar('fs.exists', (_$, e) => ({ value: /orquestacion\.json$/.test(String(e.path)) }))
+  contestar('fs.read', () => ({ value: guardado }))
+  contestar('fs.write', (_$, e) => {
+    if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
+    return { value: undefined }
+  })
+  contestar('process.run', (_$, e) => {
+    const argv = e.argv ?? []
+    if (argv[0] === 'git' && argv.includes('remote')) return bien('https://github.com/acme/plataforma.git')
+    if (argv[0] === 'git' && argv.includes('log')) return bien('')
+    if (argv.some(a => a.endsWith('gh-vt.ps1'))) return { value: { exitCode: 3, stdout: '', stderr: 'gh: Bad credentials (HTTP 401)' } }
+    if (argv[0] === 'gh' && argv.includes('token')) return bien('credencial-de-prueba')
+    if (argv[0] === 'gh' && argv.includes('user')) return bien(identidad)
+    if (argv[0] === 'gh' && argv.includes('list')) return bien(JSON.stringify([{ number: 346, title: 'Ajustar un formulario', labels: [], body: '', projectItems: [{}] }]))
+    return { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } }
+  })
+  return { escrito: () => JSON.parse(guardado) }
+}
+
+test('si el envoltorio del repositorio no responde, el control lee como la cuenta dueña y lo dice', async ($, on) => {
+  const repo = sinEnvoltorio(on, 'acme')
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('Esta sesión tiene la #346')
+  expect(respuesta).toContain('leído con la credencial que gh guarda para «acme»')
+  expect(respuesta).not.toContain('NO MEDIDO')
+  expect(respuesta).not.toContain('credencial-de-prueba')
+  expect(repo.escrito().router.issues_abiertas).toBe(1)
+})
+
+test('si esa credencial identifica a otra cuenta, no se usa: GitHub queda NO MEDIDO', async ($, on) => {
+  const repo = sinEnvoltorio(on, 'otra-cuenta')
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('NO MEDIDO')
+  expect(repo.escrito().router.issues_abiertas).toBe(null)
 })

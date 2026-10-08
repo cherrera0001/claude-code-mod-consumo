@@ -4,7 +4,10 @@ import type { Register } from 'claude-code'
 import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion } from '../types'
 import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, orden, pesar, resto, tabla } from './router'
 import type { Actividad, Asignacion, Estado, Issue, Salida, Trabajador } from './router'
+import { comoDespertar, ficha, fichaDeProduccion, nombreDeArchivo, paginaDeTareas, registroDeDespertar, saludDe, urlDeSalud } from './indice'
+import type { Ficha } from './indice'
 
+// consumo 2.1 mide, gestiona y controla, y al medir deja un index (una ficha por repositorio; ver indice.ts).
 // consumo 2.0 mide, gestiona y controla. Mide como antes. Gestiona la cola y quién tiene cada issue. Controla:
 // en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y lo escribe en
 // .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece (la decisión vive en router.ts).
@@ -56,6 +59,7 @@ const avance = atom({ plugin: 'consumo', key: 'avance' } as const, {
   repo: null,
   semanas: [],
   reparto: [],
+  index: '',
 } as Avance)
 
 // El control: la última decisión del router, en frases. Es lo que pinta la tercera pregunta del panel y lo
@@ -350,6 +354,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 # Peso por millon de tokens (entrada, salida). Sirve para REPARTIR la factura entre proyectos; no es un precio.
 PESOS = (("fable", 10.0, 50.0), ("opus", 4.0, 20.0), ("sonnet", 2.0, 10.0), ("haiku", 1.0, 5.0))
 CADUCA_S = 20 * 60
+# Version de la forma de la salida: una cache escrita por otra version no se reutiliza.
+VERSION = 2
 FORMATO = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -381,7 +387,7 @@ def lunes(iso):
 
 def nuevo():
     return {"sesiones": 0, "prompts": 0, "llamadas": 0, "peso": 0.0, "peso_sub": 0.0, "peso_relectura": 0.0,
-            "despertares": 0, "vacios": 0, "agentes": 0, "semanas": {}}
+            "despertares": 0, "vacios": 0, "agentes": 0, "semanas": {}, "raices": set()}
 
 
 def leer(ruta, desde_iso, p, es_sub, detalle):
@@ -409,6 +415,9 @@ def leer(ruta, desde_iso, p, es_sub, detalle):
             if r.get("type") == "assistant" and isinstance(m.get("usage"), dict):
                 # un mismo mensaje sale en varias lineas (una por bloque): gana la ultima
                 mensajes[m.get("id") or r.get("uuid")] = (str(m.get("model") or "?"), m["usage"], t)
+                # la carpeta en que corria la sesion: de ahi sale la raiz del proyecto para el index
+                if not es_sub and isinstance(r.get("cwd"), str) and r.get("cwd"):
+                    p["raices"].add(r["cwd"])
                 if not detalle:
                     continue
                 for b in m.get("content") or []:
@@ -437,6 +446,13 @@ def leer(ruta, desde_iso, p, es_sub, detalle):
         k = lunes(t)
         p["semanas"][k] = p["semanas"].get(k, 0.0) + w
     return bool(mensajes)
+
+
+def raiz_de(clave, p):
+    # La raiz del proyecto: la carpeta mas corta, de las que sus sesiones usaron, cuya clave es la del proyecto
+    # (un worktree comparte la clave y es mas largo). Con barras normales; vacia si ninguna coincide.
+    propias = sorted((c for c in p["raices"] if clave_de(c) == clave), key=lambda c: (len(c), c))
+    return propias[0].replace(os.sep, "/").rstrip("/") if propias else ""
 
 
 def repo_de(raiz):
@@ -493,7 +509,7 @@ def main():
         try:
             if previa or time.time() - os.path.getmtime(cache) < CADUCA_S:
                 previo = json.load(open(cache, encoding="utf-8"))
-                if (previo.get("dias") == dias and previo.get("factura") == factura
+                if (previo.get("version") == VERSION and previo.get("dias") == dias and previo.get("factura") == factura
                         and (previo.get("repo") or {}).get("nombre") == repo):
                     print(json.dumps(dict(previo, de_cache=True), ensure_ascii=False))
                     return
@@ -538,7 +554,7 @@ def main():
     if total > 0:
         for k, p in sorted(proyectos.items(), key=lambda kv: -kv[1]["peso"])[:5]:
             if p["peso"] > 0:
-                reparto.append({"nombre": re.sub("^[a-z]--(code-)?", "", k) or k,
+                reparto.append({"nombre": re.sub("^[a-z]--(code-)?", "", k) or k, "raiz": raiz_de(k, p),
                                 "pct": round(100 * p["peso"] / total, 1), "usd": round(p["peso"] / total * factura, 2)})
 
     info = {"nombre": repo, "via": "", "error": "", "abiertas": 0, "creadas": 0, "hechas": 0, "descartadas": 0,
@@ -577,6 +593,9 @@ def main():
         info["usd_por_issue"] = round(proyecto["usd_factura"] / info["hechas"], 2)
 
     salida = {
+        "version": VERSION,
+        # Donde el mod deja el index: en la carpeta del usuario, fuera de cualquier repositorio.
+        "carpeta_index": os.path.join(os.path.dirname(base), "consumo-index").replace(os.sep, "/"),
         "ahora": ahora.timestamp(), "desde": desde.strftime("%Y-%m-%d"), "dias": dias, "factura": factura,
         "proyectos_con_actividad": sum(1 for p in proyectos.values() if p["peso"] > 0),
         "proyecto": proyecto, "repo": info, "semanas": semanas, "reparto": reparto, "de_cache": False,
@@ -660,9 +679,9 @@ async function pythonDe($: any, root: string): Promise<string> {
 const barras = (ruta: string): string => ruta.replace(/\\/g, '/').replace(/\/+$/, '')
 const primeraLinea = (t: string): string => (t.split(/\r?\n/).find(l => l.trim()) ?? '').trim().slice(0, 160)
 
-async function correr($: any, argv: string[], cwd: string, timeoutMs = 30_000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+async function correr($: any, argv: string[], cwd: string, timeoutMs = 30_000, env?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
-    const r = await $.process.run(argv, { cwd, timeoutMs })
+    const r = await $.process.run(argv, env ? { cwd, timeoutMs, env } : { cwd, timeoutMs })
     return { ok: r.exitCode === 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
   } catch (exc) {
     return { ok: false, stdout: '', stderr: String(exc) }
@@ -683,6 +702,26 @@ async function leerEstado($: any, raiz: string): Promise<{ estado: Estado; texto
   }
 }
 
+/**
+ * Segundo camino para LEER las issues, el mismo con que ya se mide el avance: la credencial que `gh` guarda
+ * para la cuenta dueña del repositorio. Sólo se usa si el envoltorio del repositorio no respondió, sólo lee, y
+ * sólo si esa credencial identifica de verdad a la dueña: nunca la cuenta activa de `gh` ni otra identidad.
+ */
+async function leerIssuesComoDuena($: any, raiz: string, repoGh: string, base: string[]): Promise<{ r: { ok: boolean; stdout: string; stderr: string }; conProyecto: boolean; duena: string } | null> {
+  const duena = repoGh.split('/')[0] ?? ''
+  if (!duena) return null
+  const t = await correr($, ['gh', 'auth', 'token', '--user', duena], raiz, 20_000)
+  const credencial = t.stdout.trim()
+  if (!t.ok || !credencial) return null
+  const env = { GH_TOKEN: credencial }
+  const quien = await correr($, ['gh', 'api', 'user', '--jq', '.login'], raiz, 20_000, env)
+  if (!quien.ok || quien.stdout.trim().toLowerCase() !== duena.toLowerCase()) return null
+  let r = await correr($, ['gh', ...base, 'number,title,labels,body,projectItems'], raiz, 60_000, env)
+  if (r.ok) return { r, conProyecto: true, duena }
+  r = await correr($, ['gh', ...base, 'number,title,labels,body'], raiz, 60_000, env)
+  return r.ok ? { r, conProyecto: false, duena } : null
+}
+
 /** Las issues abiertas, de GitHub y no de un recuerdo. Si GitHub no responde, se dice y no se inventa nada. */
 async function leerIssues($: any, raiz: string, repoGh: string): Promise<{ issues: Issue[] | null; github: string }> {
   if (!repoGh) return { issues: null, github: 'NO MEDIDO: el repositorio no tiene remoto de GitHub' }
@@ -693,7 +732,15 @@ async function leerIssues($: any, raiz: string, repoGh: string): Promise<{ issue
     conProyecto = false
     r = await correr($, ghDelProyecto(raiz, ...base, 'number,title,labels,body'), raiz, 60_000)
   }
-  if (!r.ok) return { issues: null, github: `NO MEDIDO: ${primeraLinea(r.stderr) || 'gh-vt.ps1 no respondió'}` }
+  let via = ''
+  if (!r.ok) {
+    const motivo = primeraLinea(r.stderr) || 'gh-vt.ps1 no respondió'
+    const otra = await leerIssuesComoDuena($, raiz, repoGh, base)
+    if (!otra) return { issues: null, github: `NO MEDIDO: ${motivo}` }
+    r = otra.r
+    conProyecto = otra.conProyecto
+    via = `leído con la credencial que gh guarda para «${otra.duena}», porque el envoltorio del repositorio no respondió (${motivo}); escribir en las issues sigue esperando a ese envoltorio`
+  }
   try {
     const filas = JSON.parse(r.stdout) as { number: number; title: string; labels?: { name: string }[]; body?: string; projectItems?: unknown[] }[]
     return {
@@ -706,7 +753,7 @@ async function leerIssues($: any, raiz: string, repoGh: string): Promise<{ issue
         commits: [],
         medida: true,
       })),
-      github: conProyecto ? 'ok' : 'ok, sin la pertenencia al proyecto (la credencial no la deja leer)',
+      github: ['ok', conProyecto ? '' : 'sin la pertenencia al proyecto (la credencial no la deja leer)', via].filter(Boolean).join(', '),
     }
   } catch {
     return { issues: null, github: 'NO MEDIDO: la respuesta de gh no es JSON' }
@@ -808,9 +855,79 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
   const despues = `${JSON.stringify(estado, null, 2)}\n`
   // Sólo se escribe si la decisión cambió: el fichero está versionado y un árbol sucio no se despliega.
   if (despues !== antes) await $.fs.write(`${raiz}/.claude/orquestacion.json`, despues)
-  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida, orden(estado)), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
+  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
   await update($, control, () => nuevo)
   return { salida, github, orden: nuevo.orden, estado, raiz, repoGh }
+}
+
+// Lo que hizo el último despertar se guarda en el almacén del mod, por raíz de repositorio, y no en
+// .claude/orquestacion.json: ese fichero está versionado y sólo se reescribe cuando la decisión cambia.
+const claveDeDespertar = (raiz: string): string => `despertar:${barras(raiz).toLowerCase()}`
+
+async function anotarDespertar($: any, r: Decision): Promise<void> {
+  try {
+    const clave = claveDeDespertar(r.raiz)
+    const anterior = comoDespertar(await $.store.get(clave))
+    await $.store.set(clave, registroDeDespertar(r.estado, anterior, await $.clock.now()))
+  } catch {
+    // Sin almacén, el index dirá «sin despertares registrados»; la orden no depende de esto.
+  }
+}
+
+/**
+ * El index: una ficha por repositorio del reparto, sacada de su .claude/orquestacion.json y del último despertar
+ * guardado. Escribe, en la carpeta que da la medición (la del usuario, fuera de cualquier repositorio), el index
+ * de tareas —privado— y, sólo para quien declara `produccion.salud`, una ficha de producción aparte, que se arma
+ * con lo que esa URL publica y con nada del estado. Devuelve la ruta del index, o '' si no se escribió.
+ */
+async function generarIndex($: any, reparto: Avance['reparto'], carpeta: string): Promise<string> {
+  if (!carpeta) return ''
+  const destino = barras(carpeta)
+  const ahora = await $.clock.now()
+  const fichas: Ficha[] = []
+  for (const p of reparto) {
+    const raiz = p.raiz ? barras(p.raiz) : ''
+    let estado: Estado | null = null
+    let despertar = null
+    try {
+      if (raiz && (await $.fs.exists(`${raiz}/.claude/orquestacion.json`))) {
+        const leido = JSON.parse(String(await $.fs.read(`${raiz}/.claude/orquestacion.json`))) as unknown
+        if (leido && typeof leido === 'object' && !Array.isArray(leido)) estado = leido as Estado
+      }
+    } catch {
+      estado = null
+    }
+    if (estado) {
+      try {
+        despertar = comoDespertar(await $.store.get(claveDeDespertar(raiz)))
+      } catch {
+        despertar = null
+      }
+    }
+    try {
+      fichas.push(ficha(p.nombre, estado, despertar, ahora))
+    } catch {
+      // Un fichero con una forma inesperada no tumba el index: ese repositorio sale sin control.
+      fichas.push(ficha(p.nombre, null, null, ahora))
+    }
+    const url = urlDeSalud(estado)
+    if (url) {
+      // A la ficha pública sólo llega lo que la URL respondió. El estado se queda de este lado.
+      const r = await correr($, ['curl', '-s', '-m', '15', url], raiz, 20_000)
+      const publica = fichaDeProduccion({ ...saludDe(r.ok ? r.stdout : ''), cuando: ahora })
+      const base = `${destino}/produccion-${nombreDeArchivo(p.nombre)}`
+      try {
+        await $.fs.write(`${base}.html`, publica.html)
+        await $.fs.write(`${base}.json`, publica.json)
+      } catch {
+        // sin disco no hay ficha; el index de tareas se intenta igual
+      }
+    }
+  }
+  const privada = paginaDeTareas(fichas, ahora)
+  await $.fs.write(`${destino}/index.json`, privada.json)
+  await $.fs.write(`${destino}/index.html`, privada.html)
+  return `${destino}/index.html`
 }
 
 function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, ahora: string, motivo: string): Asignacion {
@@ -890,7 +1007,7 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
       await $.fs.write(`${r.raiz}/.claude/orquestacion.json`, `${JSON.stringify(conPendiente, null, 2)}\n`)
     }
   }
-  return [linea, ...frases(r.salida, orden(r.estado)), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
+  return [linea, ...frases(r.salida, orden(r.estado), r.estado.declarado), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
 }
 
 async function refrescar($: any): Promise<void> {
@@ -1002,6 +1119,7 @@ function aAvance(d: any, estado: string, cuando: number | null, factura: number)
     repo: d.repo ?? null,
     semanas: Array.isArray(d.semanas) ? d.semanas : [],
     reparto: Array.isArray(d.reparto) ? d.reparto : [],
+    index: '',
   }
 }
 
@@ -1041,7 +1159,10 @@ async function medirAvance($: any, repoCfg: string, cuentaCfg: string, factura: 
     if (forzar) argv.push('--forzar')
     const r = await $.process.run(argv, { stdin: AVANCE_PY, timeoutMs: 300_000 })
     if (r.exitCode === 0 && r.stdout.trim()) {
-      const medido = aAvance(JSON.parse(r.stdout), 'lista', ahora, factura)
+      const leido = JSON.parse(r.stdout)
+      const medido = aAvance(leido, 'lista', ahora, factura)
+      // El index se genera en el mismo momento en que se mide el reparto. Si falla, la medición vale igual.
+      medido.index = await generarIndex($, medido.reparto, typeof leido.carpeta_index === 'string' ? leido.carpeta_index : '').catch(() => '')
       await update($, avance, () => medido)
       return medido
     }
@@ -1079,7 +1200,9 @@ function lineaAvance(a: Avance): string {
       ? `${a.repo.nombre}: ${a.repo.hechas} issues cerradas, ${a.repo.creadas} creadas y ${a.repo.abiertas} abiertas desde el ${fechaCorta(a.desde)}`
       : `GitHub: ${a.repo ? a.repo.error : 'sin repositorio'}`
   const porIssue = a.repo && a.repo.usd_por_issue !== null ? ` · ≈ ${a.repo.usd_por_issue.toFixed(2)} USD por issue cerrada` : ''
-  return `avance ${repo} · este proyecto ≈ ${a.proyecto.usd_factura.toFixed(0)} USD de la factura de ${a.factura} (${a.proyecto.pct_del_total} %)${porIssue}${proyeccion(a) ? ' · ' + proyeccion(a).toLowerCase() : ''}`
+  const index = a.index ? `
+Index: ${a.index}` : ''
+  return `avance ${repo} · este proyecto ≈ ${a.proyecto.usd_factura.toFixed(0)} USD de la factura de ${a.factura} (${a.proyecto.pct_del_total} %)${porIssue}${proyeccion(a) ? ' · ' + proyeccion(a).toLowerCase() : ''}${index}`
 }
 
 function porcentaje(texto: string): number | null {
@@ -1182,6 +1305,8 @@ export const register: Register = (on, options) => {
     if (e.origin?.kind !== 'scheduled-trigger') return next(e)
     const r = await controlar($, repo)
     if (!r || 'error' in r) return next(e)
+    // Qué hizo este despertar (orden o parar, y cuántos pasos había hechos) queda para el index.
+    await anotarDespertar($, r)
     return next({ ...e, text: r.orden })
     // Si el control falla, entra el prompt original: un despertar nunca se pierde por él.
   }).catch(($, e, next) => next(e))
@@ -1372,6 +1497,11 @@ export const register: Register = (on, options) => {
               {ctl.orden}
             </Text>
           ) : null}
+          {av.index ? (
+            <Text dimColor wrap="wrap">
+              Index: {av.index}
+            </Text>
+          ) : null}
           {ctl.resto.map(f => (
             <Text dimColor wrap="wrap">
               {f}
@@ -1382,9 +1512,14 @@ export const register: Register = (on, options) => {
               {f}
             </Text>
           ))}
-          {ctl.activo && ctl.github && ctl.github !== 'ok' ? (
+          {ctl.activo && ctl.github && !ctl.github.startsWith('ok') ? (
             <Text color="red" wrap="wrap">
               GitHub: {ctl.github}. La decisión sale de la cola escrita y de git.
+            </Text>
+          ) : null}
+          {ctl.activo && ctl.github.startsWith('ok,') ? (
+            <Text dimColor wrap="wrap">
+              GitHub: {ctl.github}.
             </Text>
           ) : null}
           {ctl.candado ? (

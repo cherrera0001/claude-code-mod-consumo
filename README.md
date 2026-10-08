@@ -92,13 +92,18 @@ El control **no asigna modelo**: el modelo es el de la sesión y se lee. El dial
 5. **Le da al despertar sólo la orden.** Cuando el bucle despierta (`scheduled-trigger`), al modelo no le llega
    el prompt del bucle: le llega la issue que tiene esta sesión, **su primer paso sin hacer**, el criterio y los
    archivos. El paso no se inventa: sale de `declarado[n].pasos` del fichero, y alguien lo marca `hecho`; el
-   hook no lo da por hecho. Sin pasos, con todos hechos, o con `espera` escrito, la orden es **parar**: no se
-   recorre el tablero ni se abren issues. Si el control falla, entra el prompt original: un despertar no se
+   hook no lo da por hecho. Sin pasos o con todos hechos, la orden es **parar**: no se recorre el tablero ni se
+   abren issues. Si la issue tiene `espera` escrito, la orden es la de la siguiente de esta sesión que no
+   espere; sólo si todas esperan se para, con el motivo. Si el control falla, entra el prompt original: un despertar no se
    pierde. La misma orden, en pocas líneas, va en el prompt de sistema.
 
 Reglas que el control no negocia:
 
 - **Un trabajador, una issue.** Una asignación vigente no se reasigna.
+- **La que espera al dueño no ocupa a nadie.** Una asignación cuya issue tiene `declarado[n].espera` escrito
+  sigue siendo de su trabajador y sigue a la vista, pero no lo retiene (ni a su revisor): el control le da la
+  siguiente de la cola, y la cola no se queda entera detrás de una credencial que falta. Tampoco pasa a «por
+  retomar» por inactividad. Al borrar `espera`, vuelve a ser la primera de su trabajador.
 - Un trabajador externo que lleva **más de 30 minutos sin mover su rama** `agente/número` pasa a «por
   retomar», y el siguiente despertar se la da al siguiente que esté libre.
 - Quien está en `fuera` no recibe nada, y el motivo queda a la vista.
@@ -120,7 +125,7 @@ Para desarrollarlo desde una copia local: `claude --plugin-dir <carpeta de este 
 | Comando | Qué hace |
 |---|---|
 | `/consumo` | Pinta el panel y devuelve el resumen de la sesión |
-| `/consumo avance` | Vuelve a medir issues cerradas y parte de la factura (tarda medio minuto) |
+| `/consumo avance` | Vuelve a medir issues cerradas y parte de la factura (tarda medio minuto), regenera el index y dice dónde quedó |
 | `/consumo agentes` | Ejecuta el control y responde con una frase por issue: quién, número, peso y qué hará el próximo despertar |
 | `/consumo fuera <agy\|codex> <motivo>` | Saca a ese trabajador y mueve su issue |
 | `/consumo tomar <número> <agy\|codex\|claude>` | Reasigna a mano y lo anota en la issue con una línea |
@@ -152,14 +157,53 @@ se le dice lo que `git` y GitHub no saben. Plantilla: [`ejemplos/orquestacion.js
 | `asignaciones` | el control | Issue → trabajador, clase, peso, esfuerzo, estado y encargo |
 | `clasificacion` | el control | Todas las issues leídas, con su situación |
 | `router` | el control | Si GitHub respondió y qué anotaciones quedaron pendientes |
+| `produccion` | tú | `{ "salud": "<url de /health>" }`: de dónde sale la ficha pública de producción. Sin ella no hay ficha |
 
 El fichero sólo se reescribe cuando la decisión cambia.
 
+## El index
+
+Cada vez que el mod mide el avance (al abrir la sesión, cada media hora y con `/consumo avance`) deja además
+una foto: **una ficha por repositorio que entra en el reparto de la factura**. Cada ficha dice, y sólo dice:
+
+- la issue en curso de esa sesión (su número) y quién la tiene;
+- el paso sin hacer —el primero de `declarado[n].pasos` sin `hecho`—, o **«no hay paso»**;
+- qué hizo el último despertar del bucle: **cerró algo** (encontró más pasos hechos que el despertar anterior),
+  **dio una orden** o **paró**;
+- la hora de la foto.
+
+Sale del `.claude/orquestacion.json` de cada repositorio; el que no lo tiene aparece como «sin control» y nada
+más. Lo del último despertar lo anota el hook en el almacén del propio mod, no en ese fichero, que está
+versionado y sólo se reescribe cuando la decisión cambia.
+
+Son dos salidas, y las arman dos funciones distintas (`hooks/indice.ts`), no un filtro sobre el mismo objeto:
+
+| Salida | Dónde | Qué lleva | Qué no lleva |
+|---|---|---|---|
+| **Index de tareas**, privado | `~/.claude/consumo-index/index.html` e `index.json` | número de issue, quién la tiene, el paso, el último despertar | títulos de issues, la cola |
+| **Ficha de producción**, pública | `~/.claude/consumo-index/produccion-<nombre>.html` y `.json` | el commit publicado y si el servicio está bien | issues, pasos, nombres, cola: nada del backlog |
+
+La ficha de producción sólo existe para el repositorio que declare en su `.claude/orquestacion.json`:
+
+```json
+"produccion": { "salud": "https://ejemplo.invalid/health" }
+```
+
+El mod pide esa URL con `curl` y la ficha se arma **únicamente** con lo que responde: el campo `commit` (si es
+un SHA; cualquier otra cosa sale como «no publicado», nunca reflejada) y si `status` o `estado` dicen `ok`. La
+función que la construye recibe `{ commit, bien, cuando }` y nada más: no recibe el estado de orquestación, así
+que no puede filtrar backlog ni por descuido. Por eso se puede copiar a un sitio público; el index de tareas, no.
+
+La página muestra la foto. No reasigna, no despliega y no sustituye al hook: es HTML estático, sin guiones y
+sin estilos externos.
+
 ## Privacidad
 
-Sólo lee: las transcripciones de `~/.claude/projects`, el repositorio local y lo que `gh` devuelve con
-tu propia sesión. No escribe en el repositorio ni en GitHub. Guarda una caché de la última medición de
-avance en la carpeta temporal del sistema. Los tokens de `gh` viajan sólo en el entorno del proceso.
+Sólo lee: las transcripciones de `~/.claude/projects`, el repositorio local, lo que `gh` devuelve con
+tu propia sesión y, si la declaras, la URL de salud. No escribe en GitHub, y en el repositorio de trabajo sólo
+escribe `.claude/orquestacion.json`. Guarda una caché de la última medición de avance en la carpeta temporal
+del sistema y el index en `~/.claude/consumo-index`, fuera de cualquier repositorio. Los tokens de `gh` viajan
+sólo en el entorno del proceso.
 
 ## Desarrollo
 
@@ -167,6 +211,9 @@ avance en la carpeta temporal del sistema. Los tokens de `gh` viajan sólo en el
 claude plugin validate .
 claude plugin test .
 ```
+
+La decisión (`hooks/router.ts`) y el index (`hooks/indice.ts`) no tienen entrada ni salida: todo lo que toca
+disco, procesos o el almacén vive en `hooks/register.tsx`.
 
 Los tres guiones de `hooks/*.py` van además embebidos, tal cual, dentro de `hooks/register.tsx` (el
 módulo no conoce su propia carpeta y los ejecuta por la entrada estándar). Al cambiar uno hay que
