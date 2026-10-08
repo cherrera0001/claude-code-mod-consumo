@@ -1,13 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion } from '../types'
+import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion, Vivo } from '../types'
 import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, orden, pesar, resto, tabla } from './router'
 import type { Actividad, Asignacion, Estado, Issue, Salida, Trabajador } from './router'
 import { comoDespertar, ficha, fichaDeProduccion, nombreDeArchivo, paginaDeTareas, registroDeDespertar, saludDe, urlDeSalud } from './indice'
 import type { Ficha } from './indice'
 
-// consumo 2.1 mide, gestiona y controla, y al medir deja un index (una ficha por repositorio; ver indice.ts).
+// consumo 2.2 mide, gestiona y controla. El index lo escribe un guion sin modelo (herramientas/indice.mjs), que
+// también corre sin ninguna sesión abierta; aquí sólo se lanza y se lee. Si no está instalado, el mod deja al
+// medir el index de antes (una ficha por repositorio; ver indice.ts).
 // consumo 2.0 mide, gestiona y controla. Mide como antes. Gestiona la cola y quién tiene cada issue. Controla:
 // en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y lo escribe en
 // .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece (la decisión vive en router.ts).
@@ -74,6 +76,17 @@ const control = atom({ plugin: 'consumo', key: 'control' } as const, {
   avisos: [],
   orden: '',
 } as Control)
+
+// El index vivo: lo que dejó la última corrida del guion sin modelo. Va al panel, nunca al prompt de sistema:
+// cada cambio rompería su caché.
+const vivo = atom({ plugin: 'consumo', key: 'vivo' } as const, {
+  instalado: null,
+  carpeta: '',
+  cuello: '',
+  cuellos: 0,
+  altas: [],
+  cuando: null,
+} as Vivo)
 
 // El resumidor, tal cual está en hooks/resumen_transcripcion.py; se ejecuta por stdin porque el módulo
 // no conoce su propia carpeta (`options` trae solo la configuración del usuario).
@@ -688,9 +701,35 @@ async function correr($: any, argv: string[], cwd: string, timeoutMs = 30_000, e
   }
 }
 
+// Los nombres con que nació el mod. Lo propio de cada repositorio se declara en `herramientas` de su
+// .claude/orquestacion.json; si la clave falta, estos valen SÓLO si el fichero existe en ese repositorio.
+const GH_SI_EXISTE = 'scripts/gh-vt.ps1'
+const CANDADO_SI_EXISTE = '.vt-suite.lock'
+
+/** Una ruta declarada sólo vale si es relativa al repositorio y no sale de él. */
+function rutaDelRepositorio(x: unknown): string {
+  if (typeof x !== 'string') return ''
+  const r = x.trim().replace(/\\/g, '/')
+  return r && !r.startsWith('/') && !/^[A-Za-z]:/.test(r) && !r.split('/').includes('..') ? r : ''
+}
+
+/** El envoltorio con que este repositorio habla con GitHub, o '' si no declara ninguno ni tiene el de siempre. */
+async function envoltorioDeGh($: any, raiz: string, estado: Estado): Promise<string> {
+  const declarado = rutaDelRepositorio(estado.herramientas?.gh)
+  if (declarado) return declarado
+  try {
+    return (await $.fs.exists(`${raiz}/${GH_SI_EXISTE}`)) ? GH_SI_EXISTE : ''
+  } catch {
+    return ''
+  }
+}
+
 // GitHub del producto sólo con el envoltorio del repositorio: su token y su identidad, comprobada por él.
-function ghDelProyecto(raiz: string, ...orden: string[]): string[] {
-  return ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `${raiz}/scripts/gh-vt.ps1`, ...orden]
+function ghDelProyecto(raiz: string, envoltorio: string, ...orden: string[]): string[] {
+  const guion = `${raiz}/${envoltorio}`
+  if (/\.ps1$/i.test(envoltorio)) return ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', guion, ...orden]
+  if (/\.sh$/i.test(envoltorio)) return ['bash', guion, ...orden]
+  return [guion, ...orden]
 }
 
 // Dos ficheros. El VERSIONADO lo escribe una persona (cola, fuera, declarado, no_tocar, produccion) y el control
@@ -752,18 +791,21 @@ async function leerIssuesComoDuena($: any, raiz: string, repoGh: string, base: s
 }
 
 /** Las issues abiertas, de GitHub y no de un recuerdo. Si GitHub no responde, se dice y no se inventa nada. */
-async function leerIssues($: any, raiz: string, repoGh: string): Promise<{ issues: Issue[] | null; github: string }> {
+async function leerIssues($: any, raiz: string, repoGh: string, envoltorio: string): Promise<{ issues: Issue[] | null; github: string }> {
   if (!repoGh) return { issues: null, github: 'NO MEDIDO: el repositorio no tiene remoto de GitHub' }
   const base = ['issue', 'list', '--repo', repoGh, '--state', 'open', '--limit', '300', '--json']
   let conProyecto = true
-  let r = await correr($, ghDelProyecto(raiz, ...base, 'number,title,labels,body,projectItems'), raiz, 60_000)
-  if (!r.ok) {
-    conProyecto = false
-    r = await correr($, ghDelProyecto(raiz, ...base, 'number,title,labels,body'), raiz, 60_000)
+  let r = { ok: false, stdout: '', stderr: 'el repositorio no declara herramientas.gh en .claude/orquestacion.json' }
+  if (envoltorio) {
+    r = await correr($, ghDelProyecto(raiz, envoltorio, ...base, 'number,title,labels,body,projectItems'), raiz, 60_000)
+    if (!r.ok) {
+      conProyecto = false
+      r = await correr($, ghDelProyecto(raiz, envoltorio, ...base, 'number,title,labels,body'), raiz, 60_000)
+    }
   }
   let via = ''
   if (!r.ok) {
-    const motivo = primeraLinea(r.stderr) || 'gh-vt.ps1 no respondió'
+    const motivo = primeraLinea(r.stderr) || `${envoltorio} no respondió`
     const otra = await leerIssuesComoDuena($, raiz, repoGh, base)
     if (!otra) return { issues: null, github: `NO MEDIDO: ${motivo}` }
     r = otra.r
@@ -814,8 +856,11 @@ async function leerActividad($: any, raiz: string, ahoraMs: number): Promise<Act
       continue
     }
     let ultimo = Number((await correr($, ['git', '-C', suArbol, 'log', '-1', '--format=%ct'], raiz, 15_000)).stdout.trim()) * 1000 || 0
-    const sucios = (await correr($, ['git', '-C', suArbol, 'status', '--porcelain'], raiz, 20_000)).stdout.split(/\r?\n/).filter(Boolean).slice(0, 20)
-    for (const linea of sucios) {
+    // Sin candados opcionales: medir en el árbol de otro agente no puede competir por su index.lock.
+    const sucios = (await correr($, ['git', '--no-optional-locks', '-C', suArbol, 'status', '--porcelain'], raiz, 20_000)).stdout.split(/\r?\n/).filter(Boolean)
+    // El stash es del repositorio entero: cuentan las entradas que git anotó como salidas de esta rama.
+    const guardado = (await correr($, ['git', '--no-optional-locks', '-C', suArbol, 'stash', 'list', '--format=%gs'], raiz, 15_000)).stdout.split(/\r?\n/).filter(l => l.startsWith(`WIP on ${rama}:`) || l.startsWith(`On ${rama}:`))
+    for (const linea of sucios.slice(0, 20)) {
       const nombre = linea.slice(3).trim().replace(/^"|"$/g, '').split(' -> ').pop()!
       try {
         ultimo = Math.max(ultimo, (await $.fs.stat(`${suArbol}/${nombre}`)).mtimeMs)
@@ -823,21 +868,22 @@ async function leerActividad($: any, raiz: string, ahoraMs: number): Promise<Act
         // Un fichero borrado no tiene hora: no cuenta.
       }
     }
-    actividad[quien] = { rama, issue: Number(m[1]), hace_min: ultimo ? (ahoraMs - ultimo) / 60_000 : Number.POSITIVE_INFINITY }
+    actividad[quien] = { rama, issue: Number(m[1]), hace_min: ultimo ? (ahoraMs - ultimo) / 60_000 : Number.POSITIVE_INFINITY, sin_confirmar: sucios.length, stash: guardado.length }
   }
   return actividad
 }
 
-async function candadoDeSuite($: any, raiz: string): Promise<string> {
+async function candadoDeSuite($: any, raiz: string, estado: Estado): Promise<string> {
   try {
-    if (!(await $.fs.exists(`${raiz}/.vt-suite.lock`))) return ''
-    return primeraLinea(String(await $.fs.read(`${raiz}/.vt-suite.lock`)).replace(/\s+/g, ' ')) || 'tomado'
+    const fichero = `${raiz}/${rutaDelRepositorio(estado.herramientas?.candado) || CANDADO_SI_EXISTE}`
+    if (!(await $.fs.exists(fichero))) return ''
+    return primeraLinea(String(await $.fs.read(fichero)).replace(/\s+/g, ' ')) || 'tomado'
   } catch {
     return ''
   }
 }
 
-type Decision = { salida: Salida; github: string; orden: string; estado: Estado; raiz: string; repoGh: string }
+type Decision = { salida: Salida; github: string; orden: string; estado: Estado; raiz: string; repoGh: string; envoltorio: string }
 
 /**
  * El control: mide, decide (router.ts) y escribe. Sólo actúa en un repositorio que tenga .claude/orquestacion.json.
@@ -852,7 +898,8 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
   const { estado: leido, declarado, textoLocal: antes } = await leerEstado($, raiz)
   const fueraAntes = JSON.stringify(leido.fuera ?? {})
   const repoGh = await repoDe($, repoCfg)
-  const { issues: medidas, github } = await leerIssues($, raiz, repoGh)
+  const envoltorio = await envoltorioDeGh($, raiz, leido)
+  const { issues: medidas, github } = await leerIssues($, raiz, repoGh, envoltorio)
   // Sin GitHub no se da nada por cerrado ni se inventan títulos: se enruta la cola escrita, marcada como no medida.
   const colaEscrita = leido.cola?.length ? leido.cola : [...COLA_INICIAL]
   const issues: Issue[] =
@@ -887,9 +934,9 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
   if (despues !== antes) await $.fs.write(`${raiz}/${LOCAL}`, despues)
   // La única escritura en el versionado es una orden de la persona: «/consumo fuera» declara quién no recibe nada.
   if (JSON.stringify(estado.fuera ?? {}) !== fueraAntes) await $.fs.write(`${raiz}/${VERSIONADO}`, `${JSON.stringify({ ...declarado, fuera: estado.fuera }, null, 2)}\n`)
-  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
+  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz, estado), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
   await update($, control, () => nuevo)
-  return { salida, github, orden: nuevo.orden, estado, raiz, repoGh }
+  return { salida, github, orden: nuevo.orden, estado, raiz, repoGh, envoltorio }
 }
 
 // Lo que hizo el último despertar se guarda en el almacén del mod, por raíz de repositorio, y no en
@@ -957,6 +1004,41 @@ async function generarIndex($: any, reparto: Avance['reparto'], carpeta: string)
   await $.fs.write(`${destino}/index.json`, privada.json)
   await $.fs.write(`${destino}/index.html`, privada.html)
   return `${destino}/index.html`
+}
+
+/** La carpeta del index: la del usuario, fuera de cualquier repositorio. El módulo no la conoce; se la dice node. */
+async function carpetaDelIndex($: any, raiz: string): Promise<string> {
+  const r = await correr($, ['node', '-e', 'process.stdout.write(require("os").homedir())'], raiz, 15_000)
+  return r.ok && r.stdout.trim() ? `${barras(r.stdout.trim())}/.claude/consumo-index` : ''
+}
+
+/**
+ * El index vivo. Si el guion sin modelo está instalado en la carpeta del index, se lanza y se lee de su index.json
+ * el primer cuello de botella. No pasa por ningún modelo y no toca el prompt de sistema: va al panel y, si aparece
+ * un cuello de gravedad alta que la foto anterior no traía, a un aviso.
+ */
+async function refrescarIndexVivo($: any): Promise<Vivo> {
+  const antes = await read($, vivo)
+  try {
+    const raiz = barras(String(await $.session.root()))
+    const carpeta = antes.carpeta || (await carpetaDelIndex($, raiz))
+    if (!carpeta || !(await $.fs.exists(`${carpeta}/indice.mjs`))) {
+      await update($, vivo, v => ({ ...v, instalado: false, carpeta }))
+      return await read($, vivo)
+    }
+    await correr($, ['node', `${carpeta}/indice.mjs`], raiz, 60_000)
+    const datos = JSON.parse(String(await $.fs.read(`${carpeta}/index.json`))) as { cuellos?: { gravedad?: string; que?: string }[] }
+    const cuellos = Array.isArray(datos.cuellos) ? datos.cuellos.filter(c => c && typeof c.que === 'string') : []
+    const altas = cuellos.filter(c => c.gravedad === 'alta').map(c => String(c.que))
+    const nuevas = altas.filter(q => !antes.altas.includes(q))
+    const primero = cuellos[0]
+    await update($, vivo, () => ({ instalado: true, carpeta, cuello: primero ? `${primero.gravedad === 'alta' ? 'ALTA' : 'media'} · ${primeraLinea(String(primero.que))}` : '', cuellos: cuellos.length, altas, cuando: Date.now() }))
+    // La primera foto de la sesión no avisa: todo lo que trae sería «nuevo».
+    if (antes.cuando !== null && nuevas.length) void $.ui.toast(`Index · cuello de gravedad alta: ${primeraLinea(nuevas[0]!)}`)
+  } catch {
+    // Un index que no se pudo leer no detiene nada: el panel conserva lo último que supo.
+  }
+  return await read($, vivo)
 }
 
 function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, ahora: string, motivo: string): Asignacion {
@@ -1028,10 +1110,12 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
   const pendiente = nota as { numero: number; texto: string } | null
   if (pendiente) {
     // Una línea en la issue, no un informe. Si GitHub no la acepta, queda pendiente y a la vista.
-    const c = await correr($, ghDelProyecto(r.raiz, 'issue', 'comment', String(pendiente.numero), '--repo', r.repoGh, '--body', pendiente.texto), r.raiz, 45_000)
+    const c = r.envoltorio
+      ? await correr($, ghDelProyecto(r.raiz, r.envoltorio, 'issue', 'comment', String(pendiente.numero), '--repo', r.repoGh, '--body', pendiente.texto), r.raiz, 45_000)
+      : { ok: false, stdout: '', stderr: 'el repositorio no declara herramientas.gh' }
     if (c.ok) anotado.push(`Anotado en la #${pendiente.numero}.`)
     else {
-      anotado.push(`No se pudo anotar en la #${pendiente.numero} (${primeraLinea(c.stderr) || 'gh-vt.ps1 falló'}): queda pendiente en .claude/orquestacion.local.json.`)
+      anotado.push(`No se pudo anotar en la #${pendiente.numero} (${primeraLinea(c.stderr) || 'el envoltorio de gh falló'}): queda pendiente en .claude/orquestacion.local.json.`)
       const conPendiente = { ...r.estado, router: { ...r.estado.router!, pendientes: [...(r.estado.router?.pendientes ?? []), `#${pendiente.numero}: ${pendiente.texto}`] } }
       await $.fs.write(`${r.raiz}/${LOCAL}`, `${JSON.stringify(loDelControl(conPendiente), null, 2)}\n`)
     }
@@ -1190,8 +1274,10 @@ async function medirAvance($: any, repoCfg: string, cuentaCfg: string, factura: 
     if (r.exitCode === 0 && r.stdout.trim()) {
       const leido = JSON.parse(r.stdout)
       const medido = aAvance(leido, 'lista', ahora, factura)
-      // El index se genera en el mismo momento en que se mide el reparto. Si falla, la medición vale igual.
-      medido.index = await generarIndex($, medido.reparto, typeof leido.carpeta_index === 'string' ? leido.carpeta_index : '').catch(() => '')
+      // Con el guion instalado, el index es el suyo y el mod no genera otro. Sin él, se genera aquí como antes,
+      // en el mismo momento en que se mide el reparto. Si falla, la medición vale igual.
+      const v = await refrescarIndexVivo($)
+      medido.index = v.instalado ? `${v.carpeta}/index.html` : await generarIndex($, medido.reparto, typeof leido.carpeta_index === 'string' ? leido.carpeta_index : '').catch(() => '')
       await update($, avance, () => medido)
       return medido
     }
@@ -1317,6 +1403,11 @@ export const register: Register = (on, options) => {
     $.clock.every(180_000, () => {
       void refrescar($)
     })
+    // El index vivo: el mismo guion que corren los hooks de git y la tarea programada, cada dos minutos.
+    void refrescarIndexVivo($)
+    $.clock.every(120_000, () => {
+      void refrescarIndexVivo($)
+    })
     $.clock.every(1_800_000, () => {
       void medirAvance($, repo, cuenta, factura, false)
     })
@@ -1384,6 +1475,7 @@ export const register: Register = (on, options) => {
     const g = await read($, github)
     const av = await read($, avance)
     const ctl = await read($, control)
+    const iv = await read($, vivo)
     const conIssues = av.repo !== null && !av.repo.error
     const semanaActual = av.semanas[av.semanas.length - 1] ?? null
     const recienAbierta = !r || r.sin_transcripcion === true || r.total.llamadas === 0
@@ -1526,7 +1618,17 @@ export const register: Register = (on, options) => {
               {ctl.orden}
             </Text>
           ) : null}
-          {av.index ? (
+          {iv.instalado === true ? (
+            <Text color={iv.cuello.startsWith('ALTA') ? 'red' : undefined} wrap="wrap">
+              Index vivo · {iv.cuello ? `${iv.cuello}${iv.cuellos > 1 ? ` (y ${iv.cuellos - 1} más)` : ''}` : 'ningún cuello de botella a la vista'} · {iv.carpeta}/index.html
+            </Text>
+          ) : null}
+          {iv.instalado === false ? (
+            <Text dimColor wrap="wrap">
+              Index vivo sin instalar: «node herramientas/instalar.mjs --raiz &lt;este repositorio&gt;» desde la carpeta del mod lo deja actualizándose solo, sin sesión abierta{av.index ? ` · index de la última medición: ${av.index}` : ''}
+            </Text>
+          ) : null}
+          {iv.instalado === null && av.index ? (
             <Text dimColor wrap="wrap">
               Index: {av.index}
             </Text>

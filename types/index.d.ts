@@ -182,6 +182,20 @@ export type Control = {
   orden: string
 }
 
+/** El index vivo: lo que dejó la última corrida del guion sin modelo (herramientas/indice.mjs), si está instalado. */
+export type Vivo = {
+  /** null: todavía no se miró. false: el guion no está instalado en la carpeta del index. */
+  instalado: boolean | null
+  /** La carpeta del index, o '' si no se pudo deducir. */
+  carpeta: string
+  /** El primer cuello de botella, en una línea, o '' si no hay ninguno. */
+  cuello: string
+  cuellos: number
+  /** Los cuellos de gravedad alta de la última foto: sirven para avisar sólo de los nuevos. */
+  altas: string[]
+  cuando: number | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     consumo: {
@@ -191,6 +205,7 @@ declare module 'claude-code' {
       sesion: Sesion
       github: GitHub
       control: Control
+      vivo: Vivo
     }
   }
 }

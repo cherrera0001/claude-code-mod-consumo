@@ -1,5 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { MOTIVO_A_MEDIAS, enrutar, pesar, tabla } from './router'
+import type { Actividad, Issue } from './router'
+
 const props = { title: 'Consumo', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as const
 const viewport = { columns: 160, rows: 64, isFullscreen: true }
 
@@ -93,6 +96,11 @@ test('con una medición, el avance real muestra cierres, factura y la semana sin
 // la prueba: el disco (.claude/orquestacion.json), git y el envoltorio de GitHub del repositorio.
 type IssueDePrueba = { number: number; title: string; labels: { name: string }[]; body: string; projectItems: unknown[] }
 
+// El repositorio de la prueba declara su envoltorio de gh en `herramientas`, como pide el mod a cualquier
+// repositorio; `extra.herramientas` lo cambia (null: no declara ninguno). `extra.existen`: rutas que existen en disco.
+// `extra.vivo`: el index.json que deja el guion sin modelo, instalado en la carpeta del index de la prueba.
+const GH_DE_PRUEBA = 'scripts/gh-acme.ps1'
+const CARPETA_VIVO = 'C:/Users/prueba/.claude/consumo-index'
 // `extra.medicion`: lo que contesta la medición de avance (si no, falla, como en una máquina sin Python).
 // `extra.salud`: lo que contesta la URL de salud a curl. Lo que no es el fichero del control (el index) queda
 // en `archivos()`, por ruta.
@@ -100,12 +108,16 @@ function repositorioDePrueba(
   on: unknown,
   issues: IssueDePrueba[],
   estado: Record<string, unknown>,
-  extra: { medicion?: unknown; salud?: string } = {},
-): { escrito: () => any; versionado: () => any; local: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[] } {
+  extra: { medicion?: unknown; salud?: string; herramientas?: Record<string, string> | null; existen?: string[]; vivo?: unknown; candado?: string; git?: (argv: readonly string[]) => string | null } = {},
+): { escrito: () => any; versionado: () => any; local: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[]; corridas: () => string[][] } {
   const otros: Record<string, string> = {}
   const urls: string[] = []
+  const corridas: string[][] = []
+  const herramientas = extra.herramientas === null ? undefined : extra.herramientas ?? { gh: GH_DE_PRUEBA }
+  const conHerramientas = (e: unknown) => JSON.stringify(herramientas ? { ...(e as object), herramientas } : e)
+  const barrasNormales = (ruta: unknown) => String(ruta).replace(/\\/g, '/')
   const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string }) => unknown) => void
-  let guardado = JSON.stringify(estado)
+  let guardado = conHerramientas(estado)
   let delControl = ''
   const esLocal = (ruta: unknown) => /orquestacion\.local\.json$/.test(String(ruta))
   let entrado = ''
@@ -123,9 +135,17 @@ function repositorioDePrueba(
   contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
   contestar('fs.exists', (_$, e) => {
     if (roto) throw new Error('disco caído')
+    const ruta = barrasNormales(e.path)
+    if (extra.vivo !== undefined && ruta === `${CARPETA_VIVO}/indice.mjs`) return { value: true }
+    if ((extra.existen ?? []).some(x => ruta.endsWith(x))) return { value: true }
     return { value: esLocal(e.path) ? delControl !== '' : /orquestacion\.json$/.test(String(e.path)) }
   })
-  contestar('fs.read', (_$, e) => ({ value: esLocal(e.path) ? delControl : guardado }))
+  contestar('fs.read', (_$, e) => {
+    const ruta = barrasNormales(e.path)
+    if (extra.vivo !== undefined && ruta === `${CARPETA_VIVO}/index.json`) return { value: JSON.stringify(extra.vivo) }
+    if (extra.candado !== undefined && (extra.existen ?? []).some(x => ruta.endsWith(x))) return { value: extra.candado }
+    return { value: esLocal(e.path) ? delControl : guardado }
+  })
   contestar('fs.write', (_$, e) => {
     if (esLocal(e.path)) delControl = String(e.text)
     else if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
@@ -135,7 +155,14 @@ function repositorioDePrueba(
   })
   contestar('process.run', (_$, e) => {
     const argv = e.argv ?? []
-    if (argv.some(a => a.endsWith('gh-vt.ps1')) && argv.includes('list')) return { value: { exitCode: 0, stdout: JSON.stringify(issues), stderr: '' } }
+    corridas.push([...argv])
+    if (argv[0] === 'git' && extra.git) {
+      const dicho = extra.git(argv)
+      if (dicho !== null) return { value: { exitCode: 0, stdout: dicho, stderr: '' } }
+    }
+    if (extra.vivo !== undefined && argv[0] === 'node' && argv[1] === '-e') return { value: { exitCode: 0, stdout: 'C:\\Users\\prueba', stderr: '' } }
+    if (extra.vivo !== undefined && argv[0] === 'node' && barrasNormales(argv[1]) === `${CARPETA_VIVO}/indice.mjs`) return { value: { exitCode: 0, stdout: 'index: hecho', stderr: '' } }
+    if (argv.some(a => a.endsWith(herramientas?.gh ?? GH_DE_PRUEBA)) && argv.includes('list')) return { value: { exitCode: 0, stdout: JSON.stringify(issues), stderr: '' } }
     if (argv[0] === 'git' && argv.includes('remote')) return { value: { exitCode: 0, stdout: 'https://github.com/acme/plataforma.git', stderr: '' } }
     if (argv[0] === 'git' && argv.includes('log') && argv.includes('main')) return { value: { exitCode: 0, stdout: '', stderr: '' } }
     if (extra.medicion && argv.includes('--factura') && !argv.includes('--previa')) return { value: { exitCode: 0, stdout: JSON.stringify(extra.medicion), stderr: '' } }
@@ -148,12 +175,17 @@ function repositorioDePrueba(
   return {
     archivos: () => otros,
     pedidas: () => urls,
+    corridas: () => corridas,
     // Lo que el control decide con los dos ficheros: lo declarado más lo suyo.
     escrito: () => ({ ...JSON.parse(guardado), ...(delControl ? JSON.parse(delControl) : {}) }),
-    versionado: () => JSON.parse(guardado),
+    // Lo que la prueba declaró: el fichero versionado sin la clave `herramientas` que pone este arnés.
+    versionado: () => {
+      const { herramientas: _delArnes, ...declarado } = JSON.parse(guardado)
+      return declarado
+    },
     local: () => (delControl ? JSON.parse(delControl) : null),
     poner: e => {
-      guardado = JSON.stringify(e)
+      guardado = conHerramientas(e)
     },
     entro: () => entrado,
     romper: () => {
@@ -489,7 +521,7 @@ test('un despertar sin pasos queda en el index como «paró»', async ($, on) =>
 // ── Leer GitHub cuando el envoltorio del repositorio no responde ─────────────────────────────────────
 function sinEnvoltorio(on: unknown, identidad: string): { escrito: () => any } {
   const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string; env?: Record<string, string> }) => unknown) => void
-  let guardado = JSON.stringify({ cola: [346] })
+  let guardado = JSON.stringify({ cola: [346], herramientas: { gh: GH_DE_PRUEBA } })
   const bien = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
   contestar('ui.open', () => ({ value: undefined }))
   contestar('clock.now', () => ({ value: 1_780_000_000_000 }))
@@ -510,7 +542,7 @@ function sinEnvoltorio(on: unknown, identidad: string): { escrito: () => any } {
     const argv = e.argv ?? []
     if (argv[0] === 'git' && argv.includes('remote')) return bien('https://github.com/acme/plataforma.git')
     if (argv[0] === 'git' && argv.includes('log')) return bien('')
-    if (argv.some(a => a.endsWith('gh-vt.ps1'))) return { value: { exitCode: 3, stdout: '', stderr: 'gh: Bad credentials (HTTP 401)' } }
+    if (argv.some(a => a.endsWith(GH_DE_PRUEBA))) return { value: { exitCode: 3, stdout: '', stderr: 'gh: Bad credentials (HTTP 401)' } }
     if (argv[0] === 'gh' && argv.includes('token')) return bien('credencial-de-prueba')
     if (argv[0] === 'gh' && argv.includes('user')) return bien(identidad)
     if (argv[0] === 'gh' && argv.includes('list')) return bien(JSON.stringify([{ number: 346, title: 'Ajustar un formulario', labels: [], body: '', projectItems: [{}] }]))
@@ -564,4 +596,170 @@ test('un fichero versionado que aún trae la decisión de antes se respeta hasta
   expect(repo.local().asignaciones['347'].trabajador).toBe('claude')
   expect(repo.local().asignaciones['346']).toBeUndefined()
   expect(repo.versionado()).toEqual(antiguo)
+})
+
+// ── Lo propio de cada repositorio va en `herramientas`, no en el mod ──────────────────────────────────
+test('el envoltorio de gh sale de herramientas.gh; uno de bash se lanza con bash', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { herramientas: { gh: 'herramientas/gh-del-equipo.sh' } })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('Esta sesión tiene la #346')
+  expect(respuesta).not.toContain('NO MEDIDO')
+  const lista = repo.corridas().find(c => c.includes('list'))!
+  expect(lista.slice(0, 2)).toEqual(['bash', 'F:/proyecto/herramientas/gh-del-equipo.sh'])
+})
+
+test('sin herramientas.gh y sin el envoltorio de siempre en el repositorio, no se inventa uno: GitHub queda NO MEDIDO y se dice por qué', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { herramientas: null })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(respuesta).toContain('NO MEDIDO')
+  expect(respuesta).toContain('no declara herramientas.gh')
+  expect(repo.corridas().some(c => c.includes('powershell'))).toBe(false)
+})
+
+test('el candado de suites se lee del fichero que declara herramientas.candado', async ($, on) => {
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { herramientas: { gh: GH_DE_PRUEBA, candado: '.suite.lock' }, existen: ['/.suite.lock'], candado: 'verify PID 4321' })
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
+  expect(await pane.find({ text: /Candado de suites tomado \(verify PID 4321\)/ })).toBeDefined()
+})
+
+// ── El peso sale de la etiqueta; «bloqueada» espera al dueño ────────────────────────────────────────
+const deRouter = (numero: number, etiquetas: string[], cuerpo = ''): Issue => ({ numero, titulo: 'Ajustar un formulario', etiquetas, cuerpo, enProyecto: true, commits: [], medida: true })
+// Un cuerpo que, deducido por palabras, contesta «sí» a las cinco preguntas.
+const CUERPO_QUE_SE_PASA = 'Migración con RLS, toca el API y la web, causa no medida, se valida en navegador con pnpm e2e y hay que desplegar a producción.'
+
+test('el peso se lee de la etiqueta peso:… antes que del texto; sin etiqueta, se deduce', () => {
+  const sinEtiqueta = pesar(deRouter(1, [], CUERPO_QUE_SE_PASA), undefined)
+  expect(sinEtiqueta.puntos).toBe(5)
+  expect(tabla(sinEtiqueta.puntos).peso).toBe('XL')
+  expect(sinEtiqueta.etiqueta).toBe(null)
+  const conEtiqueta = pesar(deRouter(1, ['backend', 'peso:M'], CUERPO_QUE_SE_PASA), undefined)
+  expect(conEtiqueta.etiqueta).toBe('M')
+  expect(tabla(conEtiqueta.puntos).peso).toBe('M')
+  for (const [etiqueta, peso] of [['peso:XS', 'XS'], ['Peso: s', 'S'], ['peso:L', 'L'], ['peso:xl', 'XL']] as const) expect(tabla(pesar(deRouter(1, [etiqueta], CUERPO_QUE_SE_PASA), undefined).puntos).peso).toBe(peso)
+  // Una etiqueta que no es un peso no cuenta.
+  expect(pesar(deRouter(1, ['peso:enorme', 'sobrepeso:M'], ''), undefined).etiqueta).toBe(null)
+  // Lo declarado manda cuando contesta las cinco preguntas; si contesta sólo alguna, la etiqueta sigue valiendo.
+  const todo = { capas: false, sensible: false, diagnostico: false, navegador: true, produccion: false }
+  expect(tabla(pesar(deRouter(1, ['peso:XL'], CUERPO_QUE_SE_PASA), todo).puntos).peso).toBe('S')
+  expect(tabla(pesar(deRouter(1, ['peso:M'], CUERPO_QUE_SE_PASA), { produccion: false }).puntos).peso).toBe('M')
+})
+
+const entrada = (issues: Issue[], estado: Record<string, unknown>, actividad: Actividad = {}) => ({ raiz: 'F:/proyecto', issues, estado, actividad, ahora: '2026-05-28T20:00:00.000Z', abiertas: new Set(issues.map(i => i.numero)) })
+
+test('con la etiqueta de peso M, una issue cuyo texto daría XL se asigna en vez de quedar «por partir»', () => {
+  const s = enrutar(entrada([deRouter(7, ['peso:M'], CUERPO_QUE_SE_PASA)], { cola: [7] }))
+  expect(s.filas[0]!.situacion).toBe('asignada')
+  expect(s.filas[0]!.peso).toBe('M')
+  const sin = enrutar(entrada([deRouter(7, [], CUERPO_QUE_SE_PASA)], { cola: [7] }))
+  expect(sin.filas[0]!.situacion).toBe('partir')
+})
+
+test('una issue con la etiqueta «bloqueada» queda en «espera al dueño», salvo que lo declarado diga otra cosa', () => {
+  const s = enrutar(entrada([deRouter(7, ['bloqueada', 'peso:S']), deRouter(8, ['peso:S'])], { cola: [7, 8] }))
+  expect(s.filas[0]!.situacion).toBe('espera al dueño')
+  expect(s.filas[0]!.nota).toContain('bloqueada')
+  expect(s.asignaciones['7']).toBeUndefined()
+  // No detiene la cola: la sesión recibe la siguiente.
+  expect(s.asignaciones['8']!.trabajador).toBe('claude')
+  // Lo declarado dice otra cosa: el repositorio escribió qué falta, y eso manda sobre la etiqueta.
+  const declarada = enrutar(entrada([deRouter(7, ['Bloqueada', 'peso:S'])], { cola: [7], declarado: { '7': { falta: 'ya se destrabó: retirar el botón' } } }))
+  expect(declarada.filas[0]!.situacion).toBe('asignada')
+  // Sin la etiqueta, como siempre.
+  expect(enrutar(entrada([deRouter(7, ['peso:S'])], { cola: [7] })).filas[0]!.situacion).toBe('asignada')
+})
+
+// ── «A medias» no es «parado» ───────────────────────────────────────────────────────────────────────
+const deAgy = { '7': { trabajador: 'agy', clase: 'Construcción', puntos: 2, peso: 'M', esfuerzo: 'alto', estado: 'vigente', desde: '2026-05-28T18:00:00.000Z', motivo: 'peso M', rama: 'agy/7' } }
+
+test('un externo sin commits hace más de 30 minutos y sin nada a medias pasa a «por retomar»', () => {
+  const s = enrutar(entrada([deRouter(7, ['peso:M'])], { cola: [7], asignaciones: deAgy }, { agy: { rama: 'agy/7', issue: 7, hace_min: 45, sin_confirmar: 0, stash: 0 } }))
+  expect(s.asignaciones['7']!.estado).toBe('por retomar')
+  expect(s.avisos.join(' ')).toContain('pasa a «por retomar»')
+})
+
+test('con ficheros sin confirmar, pasados los 30 minutos, NO pasa a «por retomar»: queda vigente y se pregunta al dueño', () => {
+  const s = enrutar(entrada([deRouter(7, ['peso:M'])], { cola: [7], asignaciones: deAgy }, { agy: { rama: 'agy/7', issue: 7, hace_min: 45, sin_confirmar: 3, stash: 0 } }))
+  expect(s.asignaciones['7']!.estado).toBe('vigente')
+  expect(s.asignaciones['7']!.motivo).toBe(MOTIVO_A_MEDIAS)
+  expect(s.asignaciones['7']!.motivo).toBe('tiene trabajo a medias: preguntar al dueño antes de reasignar')
+  expect(s.asignaciones['7']!.trabajador).toBe('agy')
+  expect(s.avisos.join(' ')).toContain('3 ficheros sin confirmar')
+  expect(s.avisos.join(' ')).not.toContain('por retomar')
+})
+
+test('con entradas en el stash de su rama, pasados los 30 minutos, tampoco pasa a «por retomar»', () => {
+  const s = enrutar(entrada([deRouter(7, ['peso:M'])], { cola: [7], asignaciones: deAgy }, { agy: { rama: 'agy/7', issue: 7, hace_min: 600, sin_confirmar: 0, stash: 2 } }))
+  expect(s.asignaciones['7']!.estado).toBe('vigente')
+  expect(s.asignaciones['7']!.motivo).toBe(MOTIVO_A_MEDIAS)
+  expect(s.avisos.join(' ')).toContain('2 entradas en el stash')
+  // El trabajo a medias de OTRA rama no retiene esta issue.
+  const otra = enrutar(entrada([deRouter(7, ['peso:M'])], { cola: [7], asignaciones: deAgy }, { agy: { rama: 'agy/9', issue: 9, hace_min: 600, sin_confirmar: 4, stash: 2 } }))
+  expect(otra.asignaciones['7']!.estado).toBe('por retomar')
+})
+
+test('el control mide los ficheros sin confirmar y el stash del árbol del externo sin tomar candados, y no lo da por parado', async ($, on) => {
+  const estado = { cola: [7], asignaciones: { '7': { ...deAgy['7'], desde: '2020-01-01T00:00:00.000Z' } } }
+  const repo = repositorioDePrueba(on, [issue(7, 'Ajustar un formulario', ['peso:M'])], estado, {
+    git: argv => {
+      if (!argv.includes('F:/proyecto-agy')) return null
+      if (argv.includes('rev-parse')) return 'agy/7'
+      if (argv.includes('log')) return '1000000000'
+      if (argv.includes('status')) return ' M src/uno.ts\n?? src/dos.ts\n'
+      if (argv.includes('stash')) return 'WIP on agy/7: abc1234 algo\nOn otra/rama: no cuenta\n'
+      return null
+    },
+  })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  expect(repo.escrito().asignaciones['7'].estado).toBe('vigente')
+  expect(repo.escrito().asignaciones['7'].motivo).toBe(MOTIVO_A_MEDIAS)
+  expect(respuesta).toContain('2 ficheros sin confirmar y 1 entradas en el stash')
+  const medidas = repo.corridas().filter(c => c[0] === 'git' && (c.includes('status') || c.includes('stash')))
+  expect(medidas.length).toBeGreaterThan(1)
+  for (const c of medidas) expect(c[1]).toBe('--no-optional-locks')
+  expect(repo.corridas().some(c => c[0] === 'git' && c.includes('fetch'))).toBe(false)
+})
+
+// ── El index vivo en el panel ───────────────────────────────────────────────────────────────────────
+const INDEX_VIVO = {
+  cuellos: [
+    { gravedad: 'alta', tipo: 'migracion', que: 'El número de migración 0002 está tomado 2 veces: agy/12 (0002_a.sql) y codex/34 (0002_b.sql).', desde: '2026-05-28 20:00 UTC', repositorio: 'plataforma' },
+    { gravedad: 'media', tipo: 'stash', que: 'La rama agy/12 tiene 1 entrada en el stash.', desde: '2026-05-28 19:00 UTC', repositorio: 'plataforma' },
+  ],
+  foto: '2026-05-28 20:26 UTC',
+  repositorios: [],
+}
+
+test('con el guion instalado, el mod lo lanza y la tercera pregunta añade una línea con el primer cuello y la ruta del index', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { vivo: INDEX_VIVO, medicion: medicionConReparto([ACME]) })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'avance' } as never))
+  // El mod deja de generar el index por su cuenta: lo escribe el guion, y aquí sólo se lanza y se lee.
+  expect(repo.corridas().some(c => c[0] === 'node' && String(c[1]).replace(/\\/g, '/') === `${CARPETA_VIVO}/indice.mjs`)).toBe(true)
+  expect(Object.keys(repo.archivos()).some(ruta => ruta.endsWith('index.html') || ruta.endsWith('index.json'))).toBe(false)
+  expect(respuesta).toContain(`Index: ${CARPETA_VIVO}/index.html`)
+  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
+  expect(await pane.find({ text: /Index vivo · ALTA · El número de migración 0002 está tomado 2 veces.*\(y 1 más\) · C:\/Users\/prueba\/\.claude\/consumo-index\/index\.html/ })).toBeDefined()
+  expect(await pane.find({ text: /Index vivo sin instalar/ })).toBeUndefined()
+})
+
+test('sin el guion instalado, el panel dice cómo instalarlo y el mod sigue dejando su index al medir', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { medicion: medicionConReparto([ACME]) })
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'avance' } as never))
+  expect(respuesta).toContain(`Index: ${CARPETA_INDEX}/index.html`)
+  expect(repo.archivos()[`${CARPETA_INDEX}/index.html`]).toBeDefined()
+  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
+  expect(await pane.find({ text: /Index vivo sin instalar: «node herramientas\/instalar\.mjs --raiz/ })).toBeDefined()
+})
+
+test('los cuellos de botella no van al prompt de sistema: sólo al panel', async ($, on) => {
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] }, { vivo: INDEX_VIVO, medicion: medicionConReparto([ACME]) })
+  // Debajo del mod no hay motor que componga: la prueba contesta con un prompt sin secciones.
+  ;(on as unknown as (evento: string, hook: () => unknown) => void)('prompt.compose', () => ({ sections: [] }))
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  await $.command.run({ command: 'consumo', args: 'avance' } as never)
+  const compuesto = JSON.stringify(await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never))
+  // La sección del control sí está (la orden de la #346): lo que sigue no pasa por estar vacío el prompt.
+  expect(compuesto).toContain('#346')
+  expect(compuesto).not.toContain('migración 0002')
+  expect(compuesto).not.toContain('cuello')
 })

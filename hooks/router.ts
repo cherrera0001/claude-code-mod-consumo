@@ -98,11 +98,25 @@ export type Estado = {
   router?: { github: string; issues_abiertas: number | null; pendientes?: string[] }
   /** Dónde publica el servicio su salud (commit y estado). Sólo de ahí sale la ficha pública de producción. */
   produccion?: { salud?: string }
+  /**
+   * Lo propio de cada repositorio, con rutas relativas a su raíz: `gh`, el envoltorio con que se habla con GitHub;
+   * `candado`, el fichero del candado de suites; `migraciones`, la carpeta de migraciones; `incidentes`, el
+   * registro de incidentes de coordinación.
+   */
+  herramientas?: { gh?: string; candado?: string; migraciones?: string; incidentes?: string }
+  /** La tabla de reservas de números de migración. Las claves que empiezan por «_» y `siguiente_libre` no son reservas. */
+  migraciones?: Record<string, unknown>
   [otra: string]: unknown
 }
 
-/** Minutos desde la última actividad de la rama de cada trabajador externo; null si no tiene rama a la vista. */
-export type Actividad = Partial<Record<Trabajador, { rama: string; issue: number; hace_min: number } | null>>
+/**
+ * Lo medido en el árbol de cada trabajador externo; null si no tiene rama a la vista. `hace_min`: minutos desde
+ * su última actividad. `sin_confirmar` y `stash`: ficheros sin confirmar y entradas de stash de esa rama; con
+ * cualquiera de los dos, el trabajador tiene trabajo a medias aunque no haya commits recientes.
+ */
+export type Actividad = Partial<Record<Trabajador, { rama: string; issue: number; hace_min: number; sin_confirmar?: number; stash?: number } | null>>
+
+export const MOTIVO_A_MEDIAS = 'tiene trabajo a medias: preguntar al dueño antes de reasignar'
 
 export const INACTIVO_MIN = 30
 
@@ -110,15 +124,9 @@ export const INACTIVO_MIN = 30
 // orden de las issues que no figuran en ninguna: por número.
 export const COLA_INICIAL: readonly number[] = []
 
-export const NO_TOCAR_INICIAL: readonly string[] = [
-  'definicion/',
-  '.env',
-  'db/migrations/ (las selladas: sólo migraciones nuevas, y sólo si el encargo las pide)',
-  'CLAUDE.md',
-  'gobernanza/LEDGER.md',
-  'gobernanza/SESSION_STATE.json',
-  '.claude/orquestacion.json',
-]
+// Lo que un externo no toca si el repositorio no escribe su propia lista en `no_tocar`: sólo lo que vale para
+// cualquier repositorio. Lo propio de cada producto va en su .claude/orquestacion.json.
+export const NO_TOCAR_INICIAL: readonly string[] = ['.env', 'las migraciones ya integradas (sólo migraciones nuevas, y sólo si el encargo las pide)', 'CLAUDE.md', '.claude/orquestacion.json']
 
 export const FRASE_ENCARGO = 'No abras issues ni dejes un comentario como cierre.'
 
@@ -163,7 +171,7 @@ const CAPAS: readonly RegExp[] = [
   /\bapi\b|controlador|controller|endpoint|guard\b|servicio de dominio/,
   /contrato|openapi|packages\/contracts/,
   /\bweb\b|pantalla|pagina|page\.tsx|frontend|formulario/,
-  /packages\/ui|@vt\/ui|componente de ui/,
+  /packages\/ui|componente de ui/,
 ]
 
 /** Deduce del texto las cinco respuestas. Es una deducción y así queda marcada: lo declarado la pisa pregunta a pregunta. */
@@ -179,7 +187,28 @@ export function deducir(i: Issue): Criterios {
   }
 }
 
-export function pesar(i: Issue, d: Declarado | undefined): { criterios: Criterios; origen: Record<keyof Criterios, 'declarado' | 'deducido'>; puntos: number } {
+const PESOS: readonly Peso[] = ['XS', 'S', 'M', 'L', 'XL']
+
+/** El peso que la issue trae escrito en una etiqueta `peso:XS|S|M|L|XL`, o null si no la trae. */
+export function pesoDeEtiqueta(i: Issue): Peso | null {
+  for (const e of i.etiquetas) {
+    const m = /^peso:\s*(xs|s|m|l|xl)$/i.exec(e.trim())
+    if (m) return m[1]!.toUpperCase() as Peso
+  }
+  return null
+}
+
+/** La etiqueta que dice que la issue no puede avanzar sola. */
+export function estaBloqueada(i: Issue): boolean {
+  return tieneEtiqueta(i, /^(bloquead[ao]|blocked)$/)
+}
+
+/**
+ * El peso de lo que falta. Primero la etiqueta `peso:…` de la issue: quien la puso leyó la issue entera. Sólo si
+ * no la hay se deduce del texto, que es una deducción por palabras y se pasa. Lo declarado manda sobre las dos
+ * cuando contesta las cinco preguntas; si contesta sólo alguna, corrige esa respuesta pero no pisa la etiqueta.
+ */
+export function pesar(i: Issue, d: Declarado | undefined): { criterios: Criterios; origen: Record<keyof Criterios, 'declarado' | 'deducido'>; puntos: number; etiqueta: Peso | null } {
   const deducido = deducir(i)
   const criterios = {} as Criterios
   const origen = {} as Record<keyof Criterios, 'declarado' | 'deducido'>
@@ -188,7 +217,10 @@ export function pesar(i: Issue, d: Declarado | undefined): { criterios: Criterio
     criterios[p] = typeof dicho === 'boolean' ? dicho : deducido[p]
     origen[p] = typeof dicho === 'boolean' ? 'declarado' : 'deducido'
   }
-  return { criterios, origen, puntos: PREGUNTAS.filter(p => criterios[p]).length }
+  const etiqueta = pesoDeEtiqueta(i)
+  const todoDeclarado = PREGUNTAS.every(p => origen[p] === 'declarado')
+  const puntos = etiqueta !== null && !todoDeclarado ? PESOS.indexOf(etiqueta) : PREGUNTAS.filter(p => criterios[p]).length
+  return { criterios, origen, puntos, etiqueta: todoDeclarado ? null : etiqueta }
 }
 
 /** El criterio de aceptación tal como lo trae la issue; si no tiene sección reconocible, se dice y se remite a ella. */
@@ -273,11 +305,20 @@ export function enrutar(e: Entrada): Salida {
     const desdeEncargo = (Date.parse(e.ahora) - Date.parse(previa.desde)) / 60_000
     const enRama = act && act.issue === numero ? act.hace_min : Number.POSITIVE_INFINITY
     const enEspera = Boolean(declarado[clave]?.espera)
-    const parado = !enEspera && quien !== 'claude' && !(Math.min(enRama, Number.isFinite(desdeEncargo) ? desdeEncargo : Number.POSITIVE_INFINITY) <= INACTIVO_MIN)
+    const sinMovimiento = !enEspera && quien !== 'claude' && !(Math.min(enRama, Number.isFinite(desdeEncargo) ? desdeEncargo : Number.POSITIVE_INFINITY) <= INACTIVO_MIN)
+    // «A medias» no es «parado»: con ficheros sin confirmar o con entradas en el stash de su rama, el trabajo
+    // existe aunque no haya commits. No se reasigna por reloj: se le pregunta al dueño.
+    const sinConfirmar = act && act.issue === numero ? act.sin_confirmar ?? 0 : 0
+    const enStash = act && act.issue === numero ? act.stash ?? 0 : 0
+    const aMedias = sinMovimiento && (sinConfirmar > 0 || enStash > 0)
+    const parado = sinMovimiento && !aMedias
     const contra = previa.contra && !fuera[previa.contra] ? previa.contra : undefined
     asignaciones[clave] = parado
       ? { ...previa, contra, estado: 'por retomar', motivo: act && act.issue === numero ? `sin actividad en ${act.rama} hace ${Math.round(act.hace_min)} min` : `sin rama ${quien}/${numero} a la vista` }
-      : { ...previa, contra }
+      : aMedias
+        ? { ...previa, contra, estado: 'vigente', motivo: MOTIVO_A_MEDIAS }
+        : { ...previa, contra }
+    if (aMedias) avisos.push(`#${numero}: ${quien} no tiene commits en ${act!.rama} hace más de ${INACTIVO_MIN} min, pero ${[sinConfirmar ? `${sinConfirmar} ficheros sin confirmar` : '', enStash ? `${enStash} entradas en el stash` : ''].filter(Boolean).join(' y ')}: ${MOTIVO_A_MEDIAS}.`)
     if (!enEspera) {
       ocupado.set(quien, numero)
       if (contra) ocupado.set(contra, numero)
@@ -311,6 +352,12 @@ export function enrutar(e: Entrada): Salida {
       filas.push({ ...base, ...vacia, situacion: 'épica', nota: 'se cierra sola cuando cierran sus hijas' })
       continue
     }
+    // La etiqueta «bloqueada» deja la issue esperando al dueño, salvo que lo declarado diga otra cosa: si el
+    // repositorio escribió algo sobre ella (clase, pasos, lo que falta), eso manda. Una que ya tiene dueño no se suelta.
+    if (estaBloqueada(i) && d === undefined && !asignaciones[String(numero)]) {
+      filas.push({ ...base, ...vacia, situacion: 'espera al dueño', nota: 'espera al dueño: lleva la etiqueta «bloqueada» y nada declarado la destraba' })
+      continue
+    }
     if (clase === 'Interina') {
       filas.push({ ...base, ...vacia, situacion: 'interina', nota: 'código en main bajo decisión interina: no se cierra sin la ratificación del dueño' })
       continue
@@ -323,7 +370,7 @@ export function enrutar(e: Entrada): Salida {
       filas.push({ ...base, ...vacia, situacion: 'en cola', nota: 'peso sin medir: GitHub no respondió y no hay nada declarado sobre lo que falta' })
       continue
     }
-    const { criterios, origen, puntos } = pesar(i, d)
+    const { criterios, origen, puntos, etiqueta } = pesar(i, d)
     const t = tabla(puntos)
     const medido = { puntos, peso: t.peso, esfuerzo: t.esfuerzo, origen, criterios }
     const falta = d?.falta ? ` Falta: ${d.falta}` : ''

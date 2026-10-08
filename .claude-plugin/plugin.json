@@ -1,7 +1,7 @@
 {
   "name": "consumo",
-  "version": "2.1.1",
-  "description": "Mide, gestiona y controla el trabajo. Mide la sesión (presupuesto, contexto, ritmo), las issues cerradas contra la factura, GitHub y la cobertura. Gestiona la cola y quién tiene cada issue. Controla: en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y escribe la decisión en .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece. Al medir deja un index: una ficha por repositorio (issue en curso, paso sin hacer, qué hizo el último despertar) en un archivo local privado, y una ficha pública de producción sólo con lo que publica la URL de salud.",
+  "version": "2.2.0",
+  "description": "Mide, gestiona y controla el trabajo. Mide la sesión (presupuesto, contexto, ritmo), las issues cerradas contra la factura, GitHub y la cobertura. Gestiona la cola y quién tiene cada issue. Controla: en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y escribe la decisión en .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece. Trae un index vivo que se actualiza solo, sin modelo y sin sesión abierta: un guion de Node (herramientas/indice.mjs), disparado por hooks de git y por una tarea programada, mide árboles, ramas, trabajo sin confirmar, commits sin integrar, números de migración y remoto, pone arriba los cuellos de botella, y deja una pizarra en texto llano para los agentes que no ejecutan el mod. El index es privado; la ficha pública de producción lleva sólo commit y salud.",
   "author": {
     "name": "Agents Learning Loops"
   },

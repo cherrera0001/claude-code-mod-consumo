@@ -1,5 +1,5 @@
 {
-  "_nota": "Fichero del control de consumo 2.0. Tú escribes cola, fuera, declarado, no_tocar y produccion; el control escribe asignaciones, clasificacion y router.",
+  "_nota": "Fichero del control de consumo. Tú escribes cola, fuera, declarado, no_tocar, produccion, herramientas y migraciones; el control escribe asignaciones, clasificacion y router.",
   "cola": [
     101,
     102,
@@ -40,5 +40,26 @@
   ],
   "produccion": {
     "salud": "https://ejemplo.invalid/health"
+  },
+  "herramientas": {
+    "gh": "scripts/gh-acme.sh",
+    "candado": ".suite.lock",
+    "migraciones": "db/migrations",
+    "incidentes": ".claude/incidentes.tsv"
+  },
+  "migraciones": {
+    "_regla": "Antes de numerar una migración, reserva aquí su número. El index mide el uso real y avisa si no coincide.",
+    "0087": {
+      "issue": 101,
+      "quien": "agente backend",
+      "estado": "escrita, sin integrar",
+      "fichero": "0087_ejemplo.sql"
+    },
+    "0088": {
+      "issue": 102,
+      "quien": "agente backend",
+      "estado": "reservada"
+    },
+    "siguiente_libre": "0089"
   }
 }
