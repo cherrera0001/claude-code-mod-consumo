@@ -832,14 +832,14 @@ function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: stri
 
 /** «/consumo agentes | fuera <agy|codex> <motivo> | tomar <número> <agy|codex|claude>»: ejecuta el control y responde en frases. */
 async function ordenDeControl($: any, repoCfg: string, argumentos: string): Promise<string> {
-  const [orden = '', a = '', ...mas] = argumentos.split(/\s+/)
+  const [verbo = '', a = '', ...mas] = argumentos.split(/\s+/)
   const raiz = barras(String(await $.session.root()))
   const ahora = new Date(await $.clock.now()).toISOString()
   let linea = ''
   let nota: { numero: number; texto: string } | null = null
   let cambio: ((estado: Estado, issues: Issue[]) => string | null) | undefined
 
-  if (orden.toLowerCase() === 'fuera') {
+  if (verbo.toLowerCase() === 'fuera') {
     const quien = a.toLowerCase() as Trabajador
     const motivo = mas.join(' ').trim()
     if (!EXTERNOS.includes(quien) || !motivo) return 'Uso: «/consumo fuera <agy|codex> <motivo>». El motivo es obligatorio: queda visible.'
@@ -848,7 +848,7 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
       linea = `${quien} queda fuera: ${motivo}.`
       return null
     }
-  } else if (orden.toLowerCase() === 'tomar') {
+  } else if (verbo.toLowerCase() === 'tomar') {
     const numero = Number(a.replace('#', ''))
     const quien = (mas[0] ?? '').toLowerCase() as Trabajador
     if (!Number.isInteger(numero) || numero <= 0 || !TRABAJADORES.includes(quien)) return 'Uso: «/consumo tomar <número> <agy|codex|claude>».'

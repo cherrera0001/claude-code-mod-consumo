@@ -225,7 +225,7 @@ test('si el control falla, entra el prompt original: el despertar no se pierde',
 test('«/consumo agentes» responde en frases y no contiene la palabra «llamadas»', async ($, on) => {
   repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] })
   const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
-  expect(respuesta).toContain('El próximo despertar sigue con ella')
+  expect(respuesta).toContain('El próximo despertar para')
   expect(respuesta).not.toContain('llamadas')
   expect(respuesta).not.toContain('USD')
   expect(respuesta).not.toContain('tokens')

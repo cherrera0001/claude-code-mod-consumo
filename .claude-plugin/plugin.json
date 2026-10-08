@@ -1,6 +1,6 @@
 {
   "name": "consumo",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Mide, gestiona y controla el trabajo. Mide la sesión (presupuesto, contexto, ritmo), las issues cerradas contra la factura, GitHub y la cobertura. Gestiona la cola y quién tiene cada issue. Controla: en session.start y en cada despertar del bucle asigna, reasigna o se detiene, y escribe la decisión en .claude/orquestacion.json del repositorio de trabajo antes de que nadie empiece.",
   "author": {
     "name": "Agents Learning Loops"
