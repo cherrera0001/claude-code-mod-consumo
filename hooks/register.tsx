@@ -3,7 +3,9 @@ import type { Register } from 'claude-code'
 
 import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion, Vivo } from '../types'
 import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, orden, pesar, resto, tabla } from './router'
-import type { Actividad, Asignacion, Estado, Issue, Salida, Trabajador } from './router'
+import type { Actividad, Asignacion, Estado, Issue, Orden, Salida, Trabajador } from './router'
+import { costoPorConstruida, leerFoto } from './panel'
+import type { Lectura } from '../types'
 import { comoDespertar, ficha, fichaDeProduccion, nombreDeArchivo, paginaDeTareas, registroDeDespertar, saludDe, urlDeSalud } from './indice'
 import type { Ficha } from './indice'
 
@@ -75,7 +77,12 @@ const control = atom({ plugin: 'consumo', key: 'control' } as const, {
   resto: [],
   avisos: [],
   orden: '',
+  ordenPrompt: '',
+  firma: '',
+  causas: 0,
 } as Control)
+
+const SIN_LECTURA: Lectura = { instalado: false, vigente: false, foto_ms: null, repositorio: null, senales: [], abiertas: null, fuera: [], caducadas: [], construidas: null, primera_alta: null, foto: '', vieja: '', cuellos: [], cuellos_resto: '', quien_titulo: '', quien: [], declarado: [], flujo: [], coordinacion: [] }
 
 // El index vivo: lo que dejó la última corrida del guion sin modelo. Va al panel, nunca al prompt de sistema:
 // cada cambio rompería su caché.
@@ -86,6 +93,7 @@ const vivo = atom({ plugin: 'consumo', key: 'vivo' } as const, {
   cuellos: 0,
   altas: [],
   cuando: null,
+  lectura: SIN_LECTURA,
 } as Vivo)
 
 // El resumidor, tal cual está en hooks/resumen_transcripcion.py; se ejecuta por stdin porque el módulo
@@ -934,8 +942,16 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
   if (despues !== antes) await $.fs.write(`${raiz}/${LOCAL}`, despues)
   // La única escritura en el versionado es una orden de la persona: «/consumo fuera» declara quién no recibe nada.
   if (JSON.stringify(estado.fuera ?? {}) !== fueraAntes) await $.fs.write(`${raiz}/${VERSIONADO}`, `${JSON.stringify({ ...declarado, fuera: estado.fuera }, null, 2)}\n`)
-  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz, estado), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
+  // Las señales son los cuellos de botella de la foto vigente. Con la foto vieja, o sin index, no hay señales:
+  // el control no decide con lo que ya no se sabe si es verdad.
+  const foto = await releerIndex($, repoCfg, false)
+  const o = orden(estado, foto.lectura.vigente ? foto.lectura.senales : [])
+  const previo = await read($, control)
+  // Al prompt de sistema va la orden tal como quedó cuando cambió: reescribirla en cada foto rompería su caché.
+  const ordenPrompt = previo.firma === o.firma && previo.ordenPrompt ? previo.ordenPrompt : o.texto
+  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz, estado), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: o.texto, ordenPrompt, firma: o.firma, causas: o.causas.length }
   await update($, control, () => nuevo)
+  if (foto.instalado && foto.lectura.vigente && foto.lectura.repositorio) await anotarDecision($, foto.carpeta, foto.lectura.repositorio, o, ahoraMs)
   return { salida, github, orden: nuevo.orden, estado, raiz, repoGh, envoltorio }
 }
 
@@ -1017,28 +1033,83 @@ async function carpetaDelIndex($: any, raiz: string): Promise<string> {
  * el primer cuello de botella. No pasa por ningún modelo y no toca el prompt de sistema: va al panel y, si aparece
  * un cuello de gravedad alta que la foto anterior no traía, a un aviso.
  */
-async function refrescarIndexVivo($: any): Promise<Vivo> {
+async function leerJson($: any, ruta: string): Promise<unknown> {
+  try {
+    if (!(await $.fs.exists(ruta))) return null
+    return JSON.parse(String(await $.fs.read(ruta)))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Relee index.json y diario.json, que el guion refresca solo, y deja en el estado las líneas del panel y las señales
+ * del control. No lanza nada ni calcula nada: lee. Con `decidir`, si la decisión del control tiene más de diez
+ * minutos la vuelve a tomar, para que el panel no enseñe una orden vieja.
+ */
+async function releerIndex($: any, repoCfg: string, decidir: boolean): Promise<Vivo> {
   const antes = await read($, vivo)
   try {
     const raiz = barras(String(await $.session.root()))
     const carpeta = antes.carpeta || (await carpetaDelIndex($, raiz))
-    if (!carpeta || !(await $.fs.exists(`${carpeta}/indice.mjs`))) {
-      await update($, vivo, v => ({ ...v, instalado: false, carpeta }))
+    const instalado = Boolean(carpeta) && Boolean(await $.fs.exists(`${carpeta}/indice.mjs`))
+    if (!instalado) {
+      await update($, vivo, v => ({ ...v, instalado: false, carpeta, lectura: SIN_LECTURA }))
       return await read($, vivo)
     }
-    await correr($, ['node', `${carpeta}/indice.mjs`], raiz, 60_000)
-    const datos = JSON.parse(String(await $.fs.read(`${carpeta}/index.json`))) as { cuellos?: { gravedad?: string; que?: string }[] }
-    const cuellos = Array.isArray(datos.cuellos) ? datos.cuellos.filter(c => c && typeof c.que === 'string') : []
-    const altas = cuellos.filter(c => c.gravedad === 'alta').map(c => String(c.que))
+    const ahora = Number(await $.clock.now())
+    const lectura = leerFoto(await leerJson($, `${carpeta}/index.json`), await leerJson($, `${carpeta}/diario.json`), raiz, ahora)
+    const altas = lectura.senales.filter(c => c.gravedad === 'alta').map(c => c.que)
     const nuevas = altas.filter(q => !antes.altas.includes(q))
-    const primero = cuellos[0]
-    await update($, vivo, () => ({ instalado: true, carpeta, cuello: primero ? `${primero.gravedad === 'alta' ? 'ALTA' : 'media'} · ${primeraLinea(String(primero.que))}` : '', cuellos: cuellos.length, altas, cuando: Date.now() }))
+    const primero = lectura.cuellos[0]
+    await update($, vivo, () => ({ instalado: true, carpeta, cuello: primero ? `${primero.gravedad} · ${primeraLinea(primero.texto)}` : '', cuellos: lectura.senales.length, altas, cuando: ahora, lectura }))
     // La primera foto de la sesión no avisa: todo lo que trae sería «nuevo».
     if (antes.cuando !== null && nuevas.length) void $.ui.toast(`Index · cuello de gravedad alta: ${primeraLinea(nuevas[0]!)}`)
+    if (decidir) {
+      const c = await read($, control)
+      if (c.activo && c.cuando !== null && ahora - c.cuando > 600_000) await controlar($, repoCfg).catch(() => null)
+    }
   } catch {
     // Un index que no se pudo leer no detiene nada: el panel conserva lo último que supo.
   }
   return await read($, vivo)
+}
+
+/**
+ * El index vivo. Con una sesión abierta, el mod lanza el mismo guion que los hooks de git y la tarea programada, y
+ * después lo lee. No pasa por ningún modelo y no toca el prompt de sistema.
+ */
+async function refrescarIndexVivo($: any, repoCfg = ''): Promise<Vivo> {
+  try {
+    const raiz = barras(String(await $.session.root()))
+    const antes = await read($, vivo)
+    const carpeta = antes.carpeta || (await carpetaDelIndex($, raiz))
+    if (carpeta && (await $.fs.exists(`${carpeta}/indice.mjs`))) await correr($, ['node', `${carpeta}/indice.mjs`], raiz, 60_000)
+  } catch {
+    // Si el guion no corre, se lee la foto que haya.
+  }
+  return await releerIndex($, repoCfg, false)
+}
+
+/**
+ * El registro de decisiones: una línea cada vez que cambian las señales que mandan en la orden (también cuando
+ * dejan de mandar). El cálculo diario lo lee y dice cuánto tardó cada señal en desaparecer y cuántas volvieron:
+ * es la medida de si escuchar sirve.
+ */
+async function anotarDecision($: any, carpeta: string, repositorio: string, o: Orden, ahoraMs: number): Promise<void> {
+  try {
+    const ruta = `${carpeta}/decisiones.tsv`
+    const texto = (await $.fs.exists(ruta)) ? String(await $.fs.read(ruta)) : ''
+    const senal = o.causas.length ? o.firma : '-'
+    const suyas = texto.split(/\r?\n/).filter(l => l && !l.startsWith('#') && l.split('\t')[1] === repositorio)
+    const ultima = suyas.length ? suyas[suyas.length - 1]!.split('\t')[2] : null
+    if (ultima === senal || (ultima === null && senal === '-')) return
+    const limpio = (t: string): string => t.replace(/[\t\r\n]+/g, ' ')
+    const linea = [new Date(ahoraMs).toISOString(), limpio(repositorio), senal, limpio(o.causas.length ? o.causas.map(c => c.orden).join(' / ') : 'la orden de siempre')].join('\t')
+    await $.fs.write(ruta, `${texto || '# fecha\trepositorio\tsenales\torden\n'}${texto && !texto.endsWith('\n') ? '\n' : ''}${linea}\n`)
+  } catch {
+    // Sin registro no hay indicador de si escuchar sirve, pero la orden vale igual.
+  }
 }
 
 function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, ahora: string, motivo: string): Asignacion {
@@ -1276,7 +1347,7 @@ async function medirAvance($: any, repoCfg: string, cuentaCfg: string, factura: 
       const medido = aAvance(leido, 'lista', ahora, factura)
       // Con el guion instalado, el index es el suyo y el mod no genera otro. Sin él, se genera aquí como antes,
       // en el mismo momento en que se mide el reparto. Si falla, la medición vale igual.
-      const v = await refrescarIndexVivo($)
+      const v = await refrescarIndexVivo($, repoCfg)
       medido.index = v.instalado ? `${v.carpeta}/index.html` : await generarIndex($, medido.reparto, typeof leido.carpeta_index === 'string' ? leido.carpeta_index : '').catch(() => '')
       await update($, avance, () => medido)
       return medido
@@ -1290,34 +1361,15 @@ async function medirAvance($: any, repoCfg: string, cuentaCfg: string, factura: 
   return await read($, avance)
 }
 
-// Cuándo se vaciaría el tablero al ritmo medido: cierres menos altas por semana, sobre las últimas cuatro
-// semanas completas (la última fila es la semana en curso y no cuenta). Es una extrapolación, no un compromiso.
-function proyeccion(a: Avance): string {
-  if (!a.repo || a.repo.error || a.semanas.length < 3) return ''
-  const completas = a.semanas.slice(0, -1).slice(-4)
-  const n = completas.length
-  const cierres = completas.reduce((s, x) => s + x.hechas + x.descartadas, 0) / n
-  const altas = completas.reduce((s, x) => s + x.creadas, 0) / n
-  const ritmo = `${cierres.toFixed(1)} cierres y ${altas.toFixed(1)} altas por semana (${n} semanas)`
-  if (a.repo.abiertas === 0) return 'Proyección: no quedan issues abiertas'
-  const sinAltas = cierres > 0 ? ` · sin altas nuevas, ≈ ${Math.ceil(a.repo.abiertas / cierres)} semanas` : ''
-  if (cierres <= altas) return `Proyección: a ${ritmo} el tablero no se vacía, crece${sinAltas}`
-  const semanas = Math.ceil(a.repo.abiertas / (cierres - altas))
-  const base = Date.parse((a.semanas[a.semanas.length - 1]?.lunes ?? '') + 'T00:00:00Z')
-  const fin = new Date(base + semanas * 7 * 86400000).toISOString().slice(0, 10)
-  return `Proyección: a ${ritmo}, las ${a.repo.abiertas} abiertas se cierran en ≈ ${semanas} semanas (hacia el ${fechaCorta(fin)})${sinAltas}`
-}
-
 function lineaAvance(a: Avance): string {
   if (a.estado === 'error' || !a.proyecto) return `avance: ${a.error || 'sin medición'}`
   const repo =
     a.repo && !a.repo.error
       ? `${a.repo.nombre}: ${a.repo.hechas} issues cerradas, ${a.repo.creadas} creadas y ${a.repo.abiertas} abiertas desde el ${fechaCorta(a.desde)}`
       : `GitHub: ${a.repo ? a.repo.error : 'sin repositorio'}`
-  const porIssue = a.repo && a.repo.usd_por_issue !== null ? ` · ≈ ${a.repo.usd_por_issue.toFixed(2)} USD por issue cerrada` : ''
   const index = a.index ? `
 Index: ${a.index}` : ''
-  return `avance ${repo} · este proyecto ≈ ${a.proyecto.usd_factura.toFixed(0)} USD de la factura de ${a.factura} (${a.proyecto.pct_del_total} %)${porIssue}${proyeccion(a) ? ' · ' + proyeccion(a).toLowerCase() : ''}${index}`
+  return `avance ${repo} · este proyecto ≈ ${a.proyecto.usd_factura.toFixed(0)} USD de la factura de ${a.factura} (${a.proyecto.pct_del_total} %)${index}`
 }
 
 function porcentaje(texto: string): number | null {
@@ -1404,9 +1456,14 @@ export const register: Register = (on, options) => {
       void refrescar($)
     })
     // El index vivo: el mismo guion que corren los hooks de git y la tarea programada, cada dos minutos.
-    void refrescarIndexVivo($)
+    void refrescarIndexVivo($, repo)
     $.clock.every(120_000, () => {
-      void refrescarIndexVivo($)
+      void refrescarIndexVivo($, repo)
+    })
+    // Entre una corrida y otra del guion, los hooks de git y la tarea programada siguen refrescando la foto:
+    // se relee cada minuto, y si la decisión del control ya es vieja, se vuelve a tomar.
+    $.clock.every(60_000, () => {
+      void releerIndex($, repo, true)
     })
     $.clock.every(1_800_000, () => {
       void medirAvance($, repo, cuenta, factura, false)
@@ -1436,7 +1493,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     const c = await read($, control)
     if (!c.activo || !c.orden) return r
-    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: `Control de consumo (decide con .claude/orquestacion.json y escribe en .claude/orquestacion.local.json).\n${c.orden}`, scope: 'session' as const }] }
+    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: `Control de consumo (decide con .claude/orquestacion.json y con las señales del index; escribe en .claude/orquestacion.local.json).\n${c.ordenPrompt || c.orden}`, scope: 'session' as const }] }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -1476,8 +1533,6 @@ export const register: Register = (on, options) => {
     const av = await read($, avance)
     const ctl = await read($, control)
     const iv = await read($, vivo)
-    const conIssues = av.repo !== null && !av.repo.error
-    const semanaActual = av.semanas[av.semanas.length - 1] ?? null
     const recienAbierta = !r || r.sin_transcripcion === true || r.total.llamadas === 0
     const conCobertura = c.estado !== 'no-aplica'
     const ancho = Math.max(44, e.props.bodyColumns ?? 70)
@@ -1491,117 +1546,56 @@ export const register: Register = (on, options) => {
     const minutosSesion = s.inicio === null ? null : (Date.now() - s.inicio) / 60_000
     const d = r ? r.despertador : null
 
-    // El panel se lee en tres preguntas, en este orden. Cada cifra sale una vez y ninguna frase se corta.
+    // El panel es un resumen del index: lee lo que el guion ya midió y no vuelve a calcularlo. De arriba abajo:
+    // la foto, los cuellos de botella, la orden y su porqué, quién está en qué, el flujo, la coordinación y, al
+    // final, la sesión. Con la foto vieja no se muestra nada como vigente.
+    const L = iv.lectura
+    const vigente = iv.instalado === true && L.vigente && L.repositorio !== null
+    const declaradas = ctl.frases.filter(f => !L.caducadas.includes(Number(/#(\d+)/.exec(f)?.[1])))
+    const costo = av.proyecto ? costoPorConstruida(av.proyecto.usd_factura, av.desde ? fechaCorta(av.desde) : '', L) : ''
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
-          <Text bold wrap="wrap">
-            1 · ¿Cuánto queda de presupuesto y de contexto? · sesión de {duracion(minutosSesion)} · {hora(s.actualizado)}
-          </Text>
-          <Text wrap="wrap">
-            {`Presupuesto ${presupuesto} USD`.padEnd(22)}
-            <Text color={tono(fPresupuesto)}>{barra(fPresupuesto, anchoBarra)}</Text>{' '}
-            {gastado === null || fPresupuesto === null ? 'sin gasto medido todavía' : `quedan ${Math.max(0, presupuesto - gastado).toFixed(2)} USD (gastado el ${Math.round(fPresupuesto * 100)} %)`}
-          </Text>
-          <Text wrap="wrap">
-            {'Tanque de contexto '.padEnd(22)}
-            <Text color={tono(fContexto)}>{barra(fContexto, anchoBarra)}</Text>{' '}
-            {s.contextoPct === null ? 'se mide con la primera respuesta' : `queda libre el ${Math.max(0, 100 - s.contextoPct)} %`}
-            {s.contextoTokens === null ? '' : ` · ocupados ${miles(s.contextoTokens)}${s.ventana ? ' de ' + miles(s.ventana) : ''}`}
-          </Text>
-          <Text wrap="wrap">
-            {'Ritmo (última hora) '.padEnd(22)}
-            <Text color="cyan">{r ? chispas(r.ritmo.cubos_usd) : '▁'.repeat(12)}</Text>{' '}
-            {recienAbierta || !r ? 'sin respuestas todavía' : `${ritmoHora.toFixed(1)} USD/h`}
-          </Text>
-          <Text wrap="wrap">
-            {'Autonomía '.padEnd(22)}
-            {recienAbierta
-              ? 'sesión recién abierta: aún sin gasto'
-              : autonomiaMin === null
-                ? ritmoHora <= 0
-                  ? 'en reposo: sin gasto en los últimos 30 min'
-                  : '—'
-                : `${duracion(autonomiaMin)} hasta el presupuesto, al ritmo actual`}
-          </Text>
-          {s.error ? <Text color="red" wrap="wrap">{s.error}</Text> : null}
+          {iv.instalado === true && L.instalado && !L.vigente ? (
+            <Text bold color="red" wrap="wrap">
+              {L.vieja}
+            </Text>
+          ) : null}
+          {iv.instalado === true && L.vigente ? (
+            <Text bold wrap="wrap">
+              {L.foto}
+            </Text>
+          ) : null}
+          {iv.instalado === true && L.vigente && L.vieja ? <Text color="yellow" wrap="wrap">{L.vieja}</Text> : null}
+          {iv.instalado === true && !L.instalado ? <Text dimColor wrap="wrap">El guion del index está instalado y todavía no dejó ninguna foto que leer</Text> : null}
+          {iv.instalado === false ? (
+            <Text dimColor wrap="wrap">
+              Index vivo sin instalar: «node herramientas/instalar.mjs --raiz &lt;este repositorio&gt;» desde la carpeta del mod lo deja midiendo solo, sin sesión abierta. Sin él no hay foto: lo de abajo es sólo lo declarado y la sesión
+              {av.index ? ` · index de la última medición: ${av.index}` : ''}
+            </Text>
+          ) : null}
+          {iv.instalado === null ? <Text dimColor wrap="wrap">Leyendo el index{av.index ? ` · Index: ${av.index}` : ''}</Text> : null}
         </Box>
+
+        {vigente ? (
+          <Box flexDirection="column">
+            <Text bold wrap="wrap">
+              Cuellos de botella · {L.senales.length} ({L.senales.filter(x => x.gravedad === 'alta').length} de gravedad alta)
+            </Text>
+            {L.cuellos.length === 0 ? <Text wrap="wrap">Ninguno a la vista en esta foto</Text> : null}
+            {L.cuellos.map(x => (
+              <Text bold={x.gravedad === 'ALTA'} color={x.gravedad === 'ALTA' ? 'red' : 'yellow'} wrap="wrap">
+                {x.gravedad} · {x.texto}
+              </Text>
+            ))}
+            {L.cuellos_resto ? <Text dimColor wrap="wrap">{L.cuellos_resto}</Text> : null}
+          </Box>
+        ) : null}
 
         <Box flexDirection="column">
           <Text bold wrap="wrap">
-            2 · ¿Esta semana se cierra trabajo o sólo se gasta? · Avance real · {av.repo && av.repo.nombre ? av.repo.nombre : repo || g.repo || 'repositorio por detectar'}
-            {av.desde ? ` · desde el ${fechaCorta(av.desde)}` : ''}
-            {av.cuando === null ? '' : ` · medido ${hora(av.cuando)}`}
-            {av.estado === 'midiendo' ? (av.cuando === null ? ' · midiendo…' : ' · midiendo de nuevo…') : av.cuando === null ? ' · sin medir' : ''}
-          </Text>
-          {av.error ? <Text color="red" wrap="wrap">{av.error}</Text> : null}
-          {av.repo && av.repo.error ? <Text color="red" wrap="wrap">GitHub: {av.repo.error}</Text> : null}
-          {conIssues && semanaActual ? (
-            semanaActual.hechas > 0 ? (
-              <Text color="green" wrap="wrap">
-                Se cierra trabajo. Esta semana: {semanaActual.hechas} issues cerradas con ≈ {semanaActual.usd_factura.toFixed(0)} USD de consumo ({semanaActual.creadas} creadas)
-              </Text>
-            ) : semanaActual.usd_factura >= 1 ? (
-              <Text color="red" wrap="wrap">
-                Sólo se gasta. Esta semana: ≈ {semanaActual.usd_factura.toFixed(0)} USD de consumo y ninguna issue cerrada ({semanaActual.creadas} creadas)
-              </Text>
-            ) : (
-              <Text dimColor wrap="wrap">Esta semana todavía no tiene consumo ni cierres que contar</Text>
-            )
-          ) : null}
-          {av.repo && conIssues ? (
-            <Text wrap="wrap">
-              Issues: {av.repo.hechas} cerradas · {av.repo.descartadas} descartadas · {av.repo.creadas} creadas · {av.repo.abiertas} abiertas hoy
-            </Text>
-          ) : null}
-          {av.repo && conIssues && proyeccion(av) ? <Text wrap="wrap">{proyeccion(av)}</Text> : null}
-          {av.proyecto ? (
-            <Text wrap="wrap">
-              Factura de {av.factura} USD: este proyecto ≈ {av.proyecto.usd_factura.toFixed(0)} USD ({av.proyecto.pct_del_total} %)
-              {av.repo && av.repo.usd_por_issue !== null ? ` · ≈ ${av.repo.usd_por_issue.toFixed(2)} USD por issue cerrada` : ''}
-            </Text>
-          ) : (
-            <Text dimColor wrap="wrap">
-              {av.estado === 'midiendo'
-                ? 'midiendo: lee las transcripciones de esta máquina y las issues del repositorio (medio minuto)'
-                : 'sin medición todavía: «/consumo avance» la corre (tarda medio minuto)'}
-            </Text>
-          )}
-          {av.semanas.slice(0, -1).map(sem => (
-            <Text wrap="wrap">
-              {fechaCorta(sem.lunes)}{' '}
-              <Text color={!conIssues ? 'gray' : sem.hechas === 0 && sem.usd_factura >= 1 ? 'red' : 'green'}>{String(sem.hechas).padStart(3)} cerradas</Text> ·{' '}
-              {String(sem.creadas).padStart(3)} creadas · {String(sem.abiertas_fin).padStart(3)} abiertas · {barra(sem.pct_del_proyecto / 100, 8)}{' '}
-              {sem.usd_factura.toFixed(0).padStart(3)} USD
-            </Text>
-          ))}
-          {av.proyecto ? (
-            <Text wrap="wrap">
-              Iteración: {av.proyecto.despertares} despertares del bucle, {av.proyecto.despertares_vacios} sin cambios · {av.proyecto.agentes} subagentes (
-              {av.proyecto.pct_subagentes} % del consumo) · releer contexto {av.proyecto.pct_relectura} %
-            </Text>
-          ) : null}
-          {av.reparto.length > 0 ? (
-            <Text dimColor wrap="wrap">
-              Reparto de la factura: {av.reparto.map(p => `${p.nombre} ${p.pct} %`).join(' · ')}
-            </Text>
-          ) : null}
-          {g.error ? <Text color="red" wrap="wrap">GitHub: {g.error}</Text> : null}
-          <Text wrap="wrap">
-            Pendiente en GitHub · {hora(g.cuando)} · PR abiertos {cuantos(g.prs.length)} ({g.prs.filter(p => p.isDraft).length} en borrador)
-            {g.cuando === null ? ' · leyendo…' : g.prs.length ? ': ' + g.prs.slice(0, VISIBLES_GITHUB).map(p => `#${p.number}${p.isDraft ? ' (borrador)' : ''} ${p.title}`).join(' · ') : ''}
-            {conIssues ? '' : ` · issues abiertas ${cuantos(g.issues.length)}`}
-          </Text>
-          {conCobertura ? (
-            <Text wrap="wrap">
-              Cobertura de pruebas del repositorio: {c.total === null ? `sin dato (${c.estado})` : `${c.total} %`} · medida {hora(c.cuando)} · {c.nota}
-            </Text>
-          ) : null}
-        </Box>
-
-        <Box flexDirection="column">
-          <Text bold wrap="wrap">
-            3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar?{ctl.cuando === null ? '' : ` · decidido ${hora(ctl.cuando)}`}
+            La orden del próximo despertar{ctl.cuando === null ? '' : ` · decidida ${hora(ctl.cuando)}`}
+            {ctl.activo && ctl.causas > 0 ? ` · por ${ctl.causas} ${ctl.causas === 1 ? 'señal' : 'señales'} del index` : ''}
           </Text>
           {!ctl.activo ? (
             <Text dimColor wrap="wrap">
@@ -1610,42 +1604,14 @@ export const register: Register = (on, options) => {
                 : 'Este repositorio no tiene .claude/orquestacion.json: el control no decide aquí'}
             </Text>
           ) : null}
-          {ctl.frases.map(f => (
-            <Text wrap="wrap">{f}</Text>
-          ))}
           {ctl.orden ? (
             <Text bold wrap="wrap">
               {ctl.orden}
             </Text>
           ) : null}
-          {iv.instalado === true ? (
-            <Text color={iv.cuello.startsWith('ALTA') ? 'red' : undefined} wrap="wrap">
-              Index vivo · {iv.cuello ? `${iv.cuello}${iv.cuellos > 1 ? ` (y ${iv.cuellos - 1} más)` : ''}` : 'ningún cuello de botella a la vista'} · {iv.carpeta}/index.html
-            </Text>
-          ) : null}
-          {iv.instalado === false ? (
-            <Text dimColor wrap="wrap">
-              Index vivo sin instalar: «node herramientas/instalar.mjs --raiz &lt;este repositorio&gt;» desde la carpeta del mod lo deja actualizándose solo, sin sesión abierta{av.index ? ` · index de la última medición: ${av.index}` : ''}
-            </Text>
-          ) : null}
-          {iv.instalado === null && av.index ? (
-            <Text dimColor wrap="wrap">
-              Index: {av.index}
-            </Text>
-          ) : null}
-          {ctl.resto.map(f => (
-            <Text dimColor wrap="wrap">
-              {f}
-            </Text>
-          ))}
-          {ctl.avisos.map(f => (
-            <Text color="yellow" wrap="wrap">
-              {f}
-            </Text>
-          ))}
           {ctl.activo && ctl.github && !ctl.github.startsWith('ok') ? (
             <Text color="red" wrap="wrap">
-              GitHub: {ctl.github}. La decisión sale de la cola escrita y de git.
+              GitHub, leído por el control a las {hora(ctl.cuando)}: {ctl.github}. La decisión sale de la cola escrita y de git.
             </Text>
           ) : null}
           {ctl.activo && ctl.github.startsWith('ok,') ? (
@@ -1665,6 +1631,131 @@ export const register: Register = (on, options) => {
           ) : (
             <Text dimColor>Bucle: ninguno programado</Text>
           )}
+        </Box>
+
+        <Box flexDirection="column">
+          <Text bold wrap="wrap">
+            {vigente ? L.quien_titulo : 'Quién está en qué · sin foto vigente, sólo lo declarado'}
+          </Text>
+          {vigente && L.quien.length === 0 ? <Text wrap="wrap">Ningún árbol con trabajo vivo en esta foto</Text> : null}
+          {vigente ? L.quien.map(f => <Text wrap="wrap">{f}</Text>) : null}
+          {vigente
+            ? L.declarado.map(f => (
+                <Text color="yellow" wrap="wrap">
+                  {f}
+                </Text>
+              ))
+            : null}
+          {declaradas.map(f => (
+            <Text dimColor wrap="wrap">
+              Declarado: {f}
+            </Text>
+          ))}
+          {ctl.resto.map(f => (
+            <Text dimColor wrap="wrap">
+              {f}
+            </Text>
+          ))}
+          {ctl.avisos.map(f => (
+            <Text color="yellow" wrap="wrap">
+              {f}
+            </Text>
+          ))}
+        </Box>
+
+        {vigente ? (
+          <Box flexDirection="column">
+            <Text bold wrap="wrap">
+              Flujo
+            </Text>
+            {L.flujo.map(f => (
+              <Text wrap="wrap">{f}</Text>
+            ))}
+          </Box>
+        ) : null}
+
+        {vigente ? (
+          <Box flexDirection="column">
+            <Text bold wrap="wrap">
+              Coordinación
+            </Text>
+            {L.coordinacion.map(f => (
+              <Text wrap="wrap">{f}</Text>
+            ))}
+          </Box>
+        ) : null}
+
+        <Box flexDirection="column">
+          <Text bold wrap="wrap">
+            La sesión · {duracion(minutosSesion)} · medida {hora(s.actualizado)}
+          </Text>
+          <Text wrap="wrap">
+            {`Presupuesto ${presupuesto} USD`.padEnd(22)}
+            <Text color={tono(fPresupuesto)}>{barra(fPresupuesto, anchoBarra)}</Text>{' '}
+            {gastado === null || fPresupuesto === null ? 'sin gasto medido todavía' : `quedan ${Math.max(0, presupuesto - gastado).toFixed(2)} USD (gastado el ${Math.round(fPresupuesto * 100)} % de ${presupuesto} USD)`}
+          </Text>
+          <Text wrap="wrap">
+            {'Tanque de contexto '.padEnd(22)}
+            <Text color={tono(fContexto)}>{barra(fContexto, anchoBarra)}</Text>{' '}
+            {s.contextoPct === null ? 'se mide con la primera respuesta' : `queda libre el ${Math.max(0, 100 - s.contextoPct)} %`}
+            {s.contextoTokens === null ? '' : ` · ocupados ${miles(s.contextoTokens)}${s.ventana ? ' de ' + miles(s.ventana) : ''}`}
+          </Text>
+          <Text wrap="wrap">
+            {'Ritmo (última hora) '.padEnd(22)}
+            <Text color="cyan">{r ? chispas(r.ritmo.cubos_usd) : '▁'.repeat(12)}</Text>{' '}
+            {recienAbierta || !r ? 'sin respuestas todavía' : `${ritmoHora.toFixed(1)} USD/h`}
+          </Text>
+          <Text wrap="wrap">
+            {'Autonomía '.padEnd(22)}
+            {recienAbierta
+              ? 'sesión recién abierta: aún sin gasto'
+              : autonomiaMin === null
+                ? ritmoHora <= 0
+                  ? 'en reposo: sin gasto en los últimos 30 min'
+                  : 'NO MEDIDO (no hay presupuesto o gasto con que calcularla)'
+                : `${duracion(autonomiaMin)} hasta el presupuesto, al ritmo actual`}
+          </Text>
+          {s.error ? <Text color="red" wrap="wrap">{s.error}</Text> : null}
+          <Text wrap="wrap">
+            Avance real · {av.repo && av.repo.nombre ? av.repo.nombre : repo || g.repo || 'repositorio por detectar'}
+            {av.desde ? ` · desde el ${fechaCorta(av.desde)}` : ''}
+            {av.cuando === null ? '' : ` · medido ${hora(av.cuando)}`}
+            {av.estado === 'midiendo' ? (av.cuando === null ? ' · midiendo' : ' · midiendo de nuevo') : av.cuando === null ? ' · sin medir' : ''}
+          </Text>
+          {av.error ? <Text color="red" wrap="wrap">{av.error}</Text> : null}
+          {av.proyecto ? (
+            <Text wrap="wrap">
+              Factura de {av.factura} USD: este proyecto ≈ {av.proyecto.usd_factura.toFixed(0)} USD ({av.proyecto.pct_del_total} % del consumo de esta máquina)
+            </Text>
+          ) : (
+            <Text dimColor wrap="wrap">
+              {av.estado === 'midiendo'
+                ? 'midiendo: lee las transcripciones de esta máquina (medio minuto)'
+                : 'sin medición todavía: «/consumo avance» la corre (tarda medio minuto)'}
+            </Text>
+          )}
+          {costo ? <Text wrap="wrap">{costo}</Text> : null}
+          {av.proyecto ? (
+            <Text wrap="wrap">
+              Iteración: {av.proyecto.despertares} despertares del bucle, {av.proyecto.despertares_vacios} sin cambios · {av.proyecto.agentes} subagentes (
+              {av.proyecto.pct_subagentes} % del consumo) · releer contexto {av.proyecto.pct_relectura} %
+            </Text>
+          ) : null}
+          {av.reparto.length > 0 ? (
+            <Text dimColor wrap="wrap">
+              Reparto de la factura: {av.reparto.map(p => `${p.nombre} ${p.pct} %`).join(' · ')}
+            </Text>
+          ) : null}
+          {g.error ? <Text color="red" wrap="wrap">GitHub: {g.error}</Text> : null}
+          <Text wrap="wrap">
+            Pendiente en GitHub · {hora(g.cuando)} · PR abiertos {cuantos(g.prs.length)} ({g.prs.filter(p => p.isDraft).length} en borrador)
+            {g.cuando === null ? ' · sin leer todavía' : g.prs.length ? ': ' + g.prs.slice(0, VISIBLES_GITHUB).map(p => `#${p.number}${p.isDraft ? ' (borrador)' : ''}`).join(' · ') : ''}
+          </Text>
+          {conCobertura ? (
+            <Text wrap="wrap">
+              Cobertura de pruebas del repositorio: {c.total === null ? `sin dato (${c.estado})` : `${c.total} %`} · medida {hora(c.cuando)} · {c.nota}
+            </Text>
+          ) : null}
         </Box>
 
         <Box flexDirection="row" flexWrap="wrap" gap={2}>
@@ -1687,6 +1778,7 @@ export const register: Register = (on, options) => {
           ) : null}
         </Box>
         {r ? <Text dimColor wrap="wrap">{r.nota_precios}</Text> : null}
+        {iv.instalado === true && iv.carpeta ? <Text dimColor wrap="wrap">Detalle: {iv.carpeta}/index.html</Text> : null}
       </Box>
     )
   })

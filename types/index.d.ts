@@ -178,8 +178,50 @@ export type Control = {
   frases: string[]
   resto: string[]
   avisos: string[]
-  /** La orden del próximo despertar de esta sesión: issue, paso sin hacer, criterio y archivos; o parar. */
+  /** La orden del próximo despertar de esta sesión, con las cifras de la última foto: es la que pinta el panel. */
   orden: string
+  /**
+   * La misma orden tal como quedó la última vez que CAMBIÓ (cambiaron las señales que mandan, no la hora): es la
+   * que va al prompt de sistema, para no romper su caché en cada foto.
+   */
+  ordenPrompt: string
+  /** Qué señales mandan, sin horas ni duraciones. */
+  firma: string
+  /** Cuántas señales del index cambian la orden (0: la orden de siempre). */
+  causas: number
+}
+
+/** Una señal del index (un cuello de botella), como la lee el control. */
+export type SenalDelIndex = { tipo: string; gravedad: 'alta' | 'media'; que: string; desde?: string; datos?: Record<string, unknown> }
+
+/** Lo que el panel y el control leen de index.json y diario.json. Con la foto vieja, `vigente` es false y todo va vacío. */
+export type Lectura = {
+  /** false: no hay index.json que leer. */
+  instalado: boolean
+  /** La foto tiene diez minutos o menos. */
+  vigente: boolean
+  foto_ms: number | null
+  /** El repositorio del index que corresponde a esta sesión, o null si esta carpeta no está en él. */
+  repositorio: string | null
+  senales: SenalDelIndex[]
+  /** Los números de las issues abiertas, o null si GitHub no se midió. */
+  abiertas: number[] | null
+  fuera: string[]
+  /** Issues que lo declarado da por asignadas y lo medido contradice. */
+  caducadas: number[]
+  /** Issues construidas (con algún commit que las nombra), del cálculo diario; null si no lo hay. */
+  construidas: number | null
+  primera_alta: string | null
+  foto: string
+  /** El aviso de foto vieja, o de que esta carpeta no está en el index. */
+  vieja: string
+  cuellos: { gravedad: string; texto: string }[]
+  cuellos_resto: string
+  quien_titulo: string
+  quien: string[]
+  declarado: string[]
+  flujo: string[]
+  coordinacion: string[]
 }
 
 /** El index vivo: lo que dejó la última corrida del guion sin modelo (herramientas/indice.mjs), si está instalado. */
@@ -194,6 +236,8 @@ export type Vivo = {
   /** Los cuellos de gravedad alta de la última foto: sirven para avisar sólo de los nuevos. */
   altas: string[]
   cuando: number | null
+  /** La última foto leída, ya en líneas para el panel. */
+  lectura: Lectura
 }
 
 declare module 'claude-code' {

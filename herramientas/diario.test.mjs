@@ -344,3 +344,55 @@ test('«node indice.mjs --diario», por su camino real, corre el cálculo y term
   assert.match(salida, /diario: 0 de 1 repositorio medido/)
   assert.equal(JSON.parse(fs.readFileSync(`${e.salida}/diario.json`, 'utf8')).repositorios[e.raiz.toLowerCase()].motivo, 'el repositorio no declara credencial de GitHub')
 })
+
+// ── 2.3.0 · El registro de decisiones: ¿sirve escuchar? ─────────────────────────────────────────────
+
+test('del registro de decisiones sale cuántas señales hubo, cuánto tardó cada una en desaparecer y cuántas volvieron', () => {
+  const t = (hora, minuto = 0) => new Date(2026, 5, 24, hora, minuto).toISOString()
+  const texto = [
+    '# fecha\trepositorio\tsenales\torden',
+    `${t(9)}\tplataforma\talta:credencial:github\tParar lo que dependa de GitHub`,
+    // 09:30 · aparece además una pieza; la credencial sigue.
+    `${t(9, 30)}\tplataforma\talta:credencial:github|media:pieza:agy/12\tParar lo que dependa de GitHub`,
+    // 10:00 · la credencial se resuelve (duró 60 min); la pieza sigue.
+    `${t(10)}\tplataforma\tmedia:pieza:agy/12\tIntegrar agy/12`,
+    // 10:45 · la pieza se integra (duró 75 min): la orden de siempre.
+    `${t(10, 45)}\tplataforma\t-\tla orden de siempre`,
+    // 12:00 · la credencial vuelve a caducar: reaparece, y sigue viva.
+    `${t(12)}\tplataforma\talta:credencial:github\tParar lo que dependa de GitHub`,
+    // Otro repositorio, con su propia señal, viva.
+    `${t(11)}\totro\talta:remoto:abc\tTraer el remoto`,
+    'una línea que no es del registro',
+    '',
+  ].join('\n')
+  const ahora = new Date(2026, 5, 24, 21).getTime()
+  assert.deepEqual(diario.decisionesDe(texto, ahora), {
+    cambios: 6,
+    senales: 4, //      credencial, pieza, credencial otra vez, y el remoto del otro repositorio
+    altas: 3, //        las dos de credencial y la del remoto
+    resueltas: 2,
+    vivas: 2, //        la credencial que volvió y el remoto
+    reaparecidas: 1, // la credencial
+    duraciones_min: [60, 75],
+    mediana_min: null, // con dos duraciones no hay mediana
+    dias: 0.5, //       de las 09:00 a las 21:00
+  })
+  assert.deepEqual(diario.decisionesDe('', ahora), { cambios: 0, senales: 0, altas: 0, resueltas: 0, vivas: 0, reaparecidas: 0, duraciones_min: [], mediana_min: null, dias: 0 })
+})
+
+test('el cálculo diario guarda el registro de decisiones y la página lo enseña sin darlo por tendencia', async () => {
+  const e = escenario()
+  fs.writeFileSync(`${e.salida}/repositorios.json`, JSON.stringify({ repositorios: [{ raiz: e.raiz }] }))
+  const hace = min => new Date(Date.now() - min * 60_000).toISOString()
+  fs.writeFileSync(`${e.salida}/decisiones.tsv`, `# fecha\trepositorio\tsenales\torden\n${hace(180)}\tplataforma\talta:credencial:github\tParar\n${hace(60)}\tplataforma\t-\tla orden de siempre\n`)
+  await callado(() => diario.principalDiario(['--salida', e.salida], {}))
+  const d = JSON.parse(fs.readFileSync(`${e.salida}/diario.json`, 'utf8'))
+  assert.deepEqual([d.decisiones.cambios, d.decisiones.senales, d.decisiones.altas, d.decisiones.resueltas, d.decisiones.vivas, d.decisiones.duraciones_min], [2, 1, 1, 1, 0, [120]])
+  await callado(() => indice.principal(['--salida', e.salida, '--sin-red'], {}))
+  const html = fs.readFileSync(`${e.salida}/index.html`, 'utf8')
+  assert.match(html, /Señales que cambiaron la orden del control: 1 en 2 cambios de orden; 1 de gravedad alta\. Resueltas: 1 de 1, en 2 h 0 min; siguen vivas 0; reaparecieron 0\. Tendencia: <span class="nm">NO MEDIDO<\/span> <span class="pie">n = 0,1 días de registro, hacen falta 7: sólo conteo<\/span>/)
+  // Sin registro: NO MEDIDO, con su motivo.
+  const sin = escenario()
+  await callado(() => indice.principal(['--raiz', sin.raiz, '--salida', sin.salida, '--sin-red', '--sin-pizarra'], {}))
+  assert.match(fs.readFileSync(`${sin.salida}/index.html`, 'utf8'), /Señales que cambiaron la orden del control: <span class="nm">NO MEDIDO<\/span> <span class="pie">no hay registro de decisiones/)
+})

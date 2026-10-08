@@ -21,7 +21,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-export const VERSION = '2.2.0'
+export const VERSION = '2.3.0'
 export const MIN_SIN_INTEGRAR = 30
 export const MIN_SIN_CONFIRMAR = 30
 export const MIN_CONTROL = 30
@@ -29,6 +29,8 @@ export const MIN_DESPLIEGUE = 10
 export const MIN_FOTO_VIEJA = 10
 export const HORAS_EFIMERO_ACTIVO = 2
 export const HORAS_RESERVA_VACIA = 2
+/** Las piezas que esperan más días que éstos se cuentan juntas en un solo aviso, para que no tapen lo de hoy. */
+export const DIAS_PIEZA_VIEJA = 2
 /** El cálculo diario se rehace si el que hay tiene más horas que éstas. */
 export const HORAS_DIARIO = 20
 /** Cierres en bloque: MINIMO_BLOQUE o más cierres con HUECO_BLOQUE minutos o menos entre uno y otro. */
@@ -107,7 +109,7 @@ export const GIT_PERMITIDAS = Object.freeze({
   'config': a => a[1] === '--get',
   'remote': a => a[1] === 'get-url',
   // Entre dos commits y sólo los nombres: no mira ni toca el árbol de trabajo.
-  'diff': a => a[1] === '--name-only' && a.length === 3 && a[2].includes('...'),
+  'diff': a => (a[1] === '--name-only' || a[1] === '--quiet') && a.length >= 3 && !a[2].startsWith('-') && (a[2].includes('...') || (typeof a[3] === 'string' && !a[3].startsWith('-'))),
 })
 
 /** Para las pruebas: cada orden de git que se lanzó, sin la ruta. */
@@ -119,7 +121,8 @@ export function git(cwd, args, ms = 15_000) {
   if (ordenesDeGit.length < 5000) ordenesDeGit.push(args.slice(0, 2).join(' '))
   return new Promise(resolver => {
     execFile('git', ['--no-optional-locks', '-C', cwd, ...args], { env: entornoDeGit(), timeout: ms, maxBuffer: 64 * 1024 * 1024, windowsHide: true, encoding: 'utf8' }, (error, stdout) => {
-      resolver({ ok: !error, out: String(stdout ?? '') })
+      // `codigo`: el de salida del proceso (0 si fue bien; null si no llegó a terminar).
+      resolver({ ok: !error, out: String(stdout ?? ''), codigo: error ? (typeof error.code === 'number' ? error.code : null) : 0 })
     })
   })
 }
@@ -519,10 +522,10 @@ async function medirMigraciones(raiz, cfg, principalRef, ramas, arboles, declara
       vistos.add(`${u.numero}\0${u.sitio}`)
       const reserva = tabla.reservas.get(u.numero)
       const donde = `${u.sitio}${u.confirmado ? '' : ' (fichero sin confirmar)'}`
-      if (!reserva) alertas.push({ tipo: 'reserva', numero: u.prefijo, donde, reserva_de: null, clave: `reserva:${u.numero}:${u.sitio}`, que: `La migración ${u.prefijo} está en uso en ${donde} y no está reservada para ella.` })
+      if (!reserva) alertas.push({ tipo: 'reserva', numero: u.prefijo, donde, sitio: u.sitio, reserva_de: null, clave: `reserva:${u.numero}:${u.sitio}`, que: `La migración ${u.prefijo} está en uso en ${donde} y no está reservada para ella.` })
       else if (reserva.issue !== null && u.issues && !u.issues.has(reserva.issue)) {
         ajenas.add(u.numero)
-        alertas.push({ tipo: 'reserva', numero: u.prefijo, donde, reserva_de: reserva.issue, clave: `reserva:${u.numero}:${u.sitio}`, que: `La migración ${u.prefijo} está en uso en ${donde} y su reserva es de la #${reserva.issue}.` })
+        alertas.push({ tipo: 'reserva', numero: u.prefijo, donde, sitio: u.sitio, reserva_de: reserva.issue, clave: `reserva:${u.numero}:${u.sitio}`, que: `La migración ${u.prefijo} está en uso en ${donde} y su reserva es de la #${reserva.issue}.` })
       }
     }
     // (c) El siguiente libre declarado ya no es libre.
@@ -686,7 +689,7 @@ async function medirIntegracion(raiz, principalRef, reflog, ramas, ahora, umbral
   const huecoMin = huecoDesde === null ? null : (ahora - huecoDesde) / MIN
   return {
     medido: horas !== null,
-    sin_integrar: { total: horas ? horas.length : null, de_hoy: esperandoHoy.length, mas_viejo_ms: horas?.length ? Math.min(...horas) : null, ramas_miradas: ramas.size, por_rama: porRama },
+    sin_integrar: { total: horas ? horas.length : null, de_hoy: esperandoHoy.length, mas_viejo_de_hoy_ms: esperandoHoy.length ? Math.min(...esperandoHoy) : null, mas_viejo_ms: horas?.length ? Math.min(...horas) : null, ramas_miradas: ramas.size, por_rama: porRama },
     empujes_hoy: empujesHoy.length,
     ultimo_empuje_ms: ultimoEmpuje,
     ultima_noticia_ms: entradas[0]?.ms ?? null,
@@ -698,6 +701,8 @@ async function medirIntegracion(raiz, principalRef, reflog, ramas, ahora, umbral
   }
 }
 
+/** Lo que se despliega, si el repositorio no dice otra cosa en `produccion.rutas`: todo menos documentación y gobierno. */
+export const RUTAS_DE_PRODUCCION = Object.freeze(['.', ':(exclude)gobernanza', ':(exclude)docs', ':(exclude).claude', ':(exclude,glob)**/*.md'])
 export const POR_DEFECTO = Object.freeze({ migraciones: 'db/migrations', candado: '.vt-suite.lock', principal: 'main', incidentes: '.claude/incidentes.tsv', dias_rama_antigua: 14 })
 
 /** La configuración de un repositorio: lo de repositorios.json manda; después su orquestacion.json; después el valor por defecto. */
@@ -739,7 +744,7 @@ export async function medirRepositorio(entrada, opciones = {}) {
   const [wt, refs, stashes, cabeza, reflog, remoto, movido] = await Promise.all([
     git(raiz, ['worktree', 'list', '--porcelain']),
     git(raiz, ['for-each-ref', `--format=${FORMATO}%00%(ahead-behind:${principalRef})`, 'refs/heads']),
-    git(raiz, ['stash', 'list', '--format=%ct%x00%gs']),
+    git(raiz, ['stash', 'list', '--format=%ct%x00%gs%x00%H']),
     git(raiz, ['log', '-1', '--format=%H%x00%ct', principalRef]),
     git(raiz, ['reflog', 'show', principalRef, '--format=%H%x00%ct%x00%gs']),
     git(raiz, ['remote', 'get-url', 'origin']),
@@ -771,10 +776,26 @@ export async function medirRepositorio(entrada, opciones = {}) {
 
   // «WIP on <rama>: …» y «On <rama>: …» son las dos formas en que git anota de qué rama salió una entrada.
   const stash = new Map()
+  const revisados = Array.isArray(declarado?.herramientas?.stash_revisados) ? declarado.herramientas.stash_revisados.filter(x => typeof x === 'string' && x.trim()) : []
+  let stashSinRiesgo = 0
   for (const linea of stashes.ok ? stashes.out.split(/\r?\n/) : []) {
-    const [ct, asunto] = linea.split('\0')
+    const [ct, asunto, sha] = linea.split('\0')
     const m = /^(?:WIP on|On) ([^:]+):/.exec(asunto ?? '')
     if (!m || m[1].startsWith('(')) continue
+    let sinRiesgo = revisados.some(x => (asunto ?? '').includes(x.trim()))
+    if (!sinRiesgo && hayPrincipal && sha) {
+      // Los ficheros que la entrada toca, y si tal como quedaron en ella ya están así en la rama principal remota.
+      const tocados = await git(raiz, ['diff', '--name-only', `${sha}^1`, sha])
+      const ficheros = tocados.ok ? tocados.out.split(/\r?\n/).filter(Boolean) : []
+      if (ficheros.length && ficheros.length <= 300) {
+        const igual = await git(raiz, ['diff', '--quiet', sha, principalRef, '--', ...ficheros])
+        sinRiesgo = igual.codigo === 0
+      }
+    }
+    if (sinRiesgo) {
+      stashSinRiesgo++
+      continue
+    }
     if (!stash.has(m[1])) stash.set(m[1], [])
     stash.get(m[1]).push(Number(ct) * 1000)
   }
@@ -937,6 +958,8 @@ export async function medirRepositorio(entrada, opciones = {}) {
               else if (etiquetas.some(e => /^(bloquead[ao]|blocked|decision-humana|type:decision)$/.test(e))) cuenta.etiqueta++
               else if (etiquetas.some(e => /^peso:\s*xl$/.test(e))) cuenta.xl++
             }
+            // Sólo números: sirven para saber si lo declarado habla de una issue que ya no está abierta.
+            github.abiertas_numeros = nodos.map(nodo => nodo.number).filter(Number.isInteger)
             github.no_avanzan = { total: cuenta.espera + cuenta.etiqueta + cuenta.xl, denominador, ...cuenta, miradas: nodos.length, abiertas: Number.isInteger(github.issues_abiertas) ? github.issues_abiertas : nodos.length }
           }
         } catch {
@@ -956,9 +979,10 @@ export async function medirRepositorio(entrada, opciones = {}) {
     }
   }
 
-  // Producción: lo que publica la URL de salud, y nada más.
+  // Producción: lo que publica la URL de salud, y nada más. Que el commit sea otro no basta: sólo es un problema
+  // si entre lo desplegado y la principal cambió código de lo que se despliega (las rutas de `produccion.rutas`).
   const url = urlDeSalud(declarado)
-  const produccion = { declarada: Boolean(url), estado: 'sin medir', commit: null, bien: null, coincide: null }
+  const produccion = { declarada: Boolean(url), estado: 'sin medir', commit: null, bien: null, coincide: null, codigo: null }
   let salud = null
   if (url && !sinRed) {
     const r = await pedir(url, {})
@@ -968,6 +992,16 @@ export async function medirRepositorio(entrada, opciones = {}) {
     produccion.bien = salud.bien
     const esperado = remotoAhora ?? shaPrincipal
     produccion.coincide = salud.commit && esperado ? esperado.startsWith(salud.commit) || salud.commit.startsWith(esperado) : null
+    if (produccion.coincide === true) produccion.codigo = 'igual'
+    else if (produccion.coincide === false && shaPrincipal) {
+      const esta = await git(raiz, ['rev-parse', '--verify', '--quiet', `${salud.commit}^{commit}`])
+      if (!esta.ok || !esta.out.trim()) produccion.codigo = 'no comparable'
+      else {
+        const rutas = Array.isArray(declarado?.produccion?.rutas) && declarado.produccion.rutas.every(x => typeof x === 'string' && x && !x.startsWith('-')) && declarado.produccion.rutas.length ? declarado.produccion.rutas : RUTAS_DE_PRODUCCION
+        const d = await git(raiz, ['diff', '--quiet', esta.out.trim(), shaPrincipal, '--', ...rutas])
+        produccion.codigo = d.codigo === 0 ? 'igual' : d.codigo === 1 ? 'distinto' : 'no comparable'
+      }
+    }
   }
 
   const limiteEfimero = HORAS_EFIMERO_ACTIVO * 60
@@ -1016,6 +1050,12 @@ export async function medirRepositorio(entrada, opciones = {}) {
     todos,
     localMs: control.local_hace_min === null ? null : ahora - control.local_hace_min * MIN,
   }
+  for (const a of [...repo.arboles, ...repo.efimeros.inactivos]) {
+    const e = estadoDeArbol(a)
+    a.estado = e.palabra
+    a.forma = e.forma
+  }
+  repo.stash_sin_riesgo = stashSinRiesgo
   return { repo, salud, comun: dirComun, interno }
 }
 
@@ -1037,10 +1077,13 @@ export function cuellosDe(medido, ahora, vistos = { antes: {}, ahora: {} }) {
     vistos.ahora[k] = ms
     return ms
   }
-  const poner = (gravedad, tipo, que, desdeMs) => cuellos.push({ gravedad, tipo, que, desde: instante(desdeMs), desde_ms: Math.round(desdeMs), repositorio: repo.nombre })
+  // `datos`: lo que el control necesita para decidir con esta señal, sin tener que leer la frase.
+  const poner = (gravedad, tipo, que, desdeMs, datos = {}) => cuellos.push({ gravedad, tipo, que, desde: instante(desdeMs), desde_ms: Math.round(desdeMs), repositorio: repo.nombre, datos })
+  const deLaSesion = a => a.principal || interno.claves.get(a.ruta) === 'claude'
+  const p95 = repo.integracion.umbral
   const etiqueta = a => (a.principal ? `sesión principal (${a.rama ?? 'HEAD suelto'})` : `${a.trabajador ?? 'sin identificar'} (${a.rama ?? 'HEAD suelto'})`)
 
-  if (repo.github.credencial.estado === 'rechazada (401)') poner('alta', 'credencial', 'GitHub rechazó la credencial declarada (401): issues y despliegue quedan sin medir hasta renovarla.', desdeVisto('credencial'))
+  if (repo.github.credencial.estado === 'rechazada (401)') poner('alta', 'credencial', 'GitHub rechazó la credencial declarada (401): issues y despliegue quedan sin medir hasta renovarla.', desdeVisto('credencial'), { http: 401, hora: repo.github.credencial.cuando })
 
   // Un aviso por número de migración: todo lo que se sabe de él, en una frase.
   const porNumero = new Map()
@@ -1060,14 +1103,16 @@ export function cuellosDe(medido, ahora, vistos = { antes: {}, ahora: {} }) {
       if (x.ajena.length) partes.push(`Además su reserva es de la #${x.ajena[0].reserva_de}, y lo usa ${x.ajena.map(a => a.donde).join(' y ')}.`)
     } else if (x.sinReserva.length) partes.push(`La migración ${x.numero} está en uso en ${x.sinReserva.map(a => a.donde).join(' y en ')} y no está reservada para ella.${x.ajena.length ? ` Además su reserva es de la #${x.ajena[0].reserva_de}, y la usa ${x.ajena.map(a => a.donde).join(' y ')}.` : ''}`)
     else partes.push(`La migración ${x.numero} está en uso en ${x.ajena.map(a => a.donde).join(' y en ')} y su reserva es de la #${x.ajena[0].reserva_de}.`)
-    poner('alta', 'migracion', partes.join(' '), desdeVisto(`migracion:${Number(x.numero)}`))
+    const sitios = [...(x.repetida?.entre.map(e => e.rama) ?? []), ...x.sinReserva.map(a => a.sitio), ...x.ajena.map(a => a.sitio)].filter(Boolean)
+    const arbolPrincipal = interno.todos[0]?.rama ?? null
+    poner('alta', 'migracion', partes.join(' '), desdeVisto(`migracion:${Number(x.numero)}`), { numero: x.numero, ramas: [...new Set(sitios)], issues: [...new Set(sitios.map(sitio => trabajadorDe(sitio, false).issue).filter(n => n !== null))], sesion: sitios.some(sitio => sitio === arbolPrincipal || /^claude\//.test(sitio)) })
   }
 
   const g = repo.integracion
   if (g.sobre_el_umbral && g.sin_integrar.de_hoy > 0) {
-    poner('alta', 'hueco', `Hace ${hace(g.hueco_min)} que nada llega a ${repo.origen.rama} y hay ${g.sin_integrar.de_hoy} commits de hoy esperando. Lo habitual es menos: el percentil 95 de los huecos entre empujes es ${g.umbral.p95_min} min (n = ${g.umbral.n}).`, g.hueco_desde_ms)
+    poner('alta', 'hueco', `Hace ${hace(g.hueco_min)} que nada llega a ${repo.origen.rama} y hay ${g.sin_integrar.de_hoy} commits de hoy esperando. Lo habitual es menos: el percentil 95 de los huecos entre empujes es ${g.umbral.p95_min} min (n = ${g.umbral.n}).`, g.hueco_desde_ms, { hueco_min: Math.round(g.hueco_min), p95_min: g.umbral.p95_min, n: g.umbral.n, commits_de_hoy: g.sin_integrar.de_hoy })
   }
-  for (const issue of repo.control.esperas_caducadas) poner('media', 'caducado', `Lo declarado está caducado: la #${issue} figura en espera y su rama ya llegó a ${repo.origen.rama}.`, desdeVisto(`caducado:${issue}`))
+  for (const issue of repo.control.esperas_caducadas) poner('media', 'caducado', `Lo declarado está caducado: la #${issue} figura en espera y su rama ya llegó a ${repo.origen.rama}.`, desdeVisto(`caducado:${issue}`), { issue })
 
   for (const a of repo.migraciones.alertas.filter(x => x.tipo !== 'reserva')) poner('alta', a.tipo, a.que, desdeVisto(a.clave))
   for (const numero of repo.migraciones.reservas.sin_fichero) {
@@ -1080,7 +1125,7 @@ export function cuellosDe(medido, ahora, vistos = { antes: {}, ahora: {} }) {
   if (repo.origen.remoto_movido === true && conTrabajo.length) {
     const nombres = conTrabajo.filter(a => !a.efimero).map(a => a.rama ?? a.ruta).slice(0, 6)
     const efimeros = conTrabajo.filter(a => a.efimero).length
-    poner('alta', 'remoto', `El remoto movió ${repo.origen.rama} (${repo.origen.commit} → ${repo.origen.remoto}) y hay trabajo debajo: ${[...nombres, efimeros ? `${efimeros} árboles efímeros` : ''].filter(Boolean).join(', ')}. Hay que traerlo antes de empujar.`, desdeVisto(`remoto:${repo.origen.remoto}`))
+    poner('alta', 'remoto', `El remoto movió ${repo.origen.rama} (${repo.origen.commit} → ${repo.origen.remoto}) y hay trabajo debajo: ${[...nombres, efimeros ? `${efimeros} árboles efímeros` : ''].filter(Boolean).join(', ')}. Hay que traerlo antes de empujar.`, desdeVisto(`remoto:${repo.origen.remoto}`), { de: repo.origen.commit, a: repo.origen.remoto, sesion: conTrabajo.some(deLaSesion) })
   }
 
   const d = repo.github.despliegue
@@ -1091,8 +1136,11 @@ export function cuellosDe(medido, ahora, vistos = { antes: {}, ahora: {} }) {
 
   const p = repo.produccion
   if (p.estado === 'medida') {
-    if (p.bien !== true) poner('alta', 'produccion', 'Producción responde con problemas o no responde.', desdeVisto('produccion:salud'))
-    else if (p.coincide === false) poner('alta', 'produccion', `Producción corre ${p.commit} y ${repo.origen.rama} está en ${repo.origen.remoto !== 'sin medir' ? repo.origen.remoto : repo.origen.commit}.`, desdeVisto(`produccion:${p.commit}`))
+    const principal = repo.origen.remoto !== 'sin medir' ? repo.origen.remoto : repo.origen.commit
+    if (p.bien !== true) poner('alta', 'produccion', 'Producción responde con problemas o no responde.', desdeVisto('produccion:salud'), { codigo: 'caida' })
+    // Otro commit no basta: sólo es un cuello si entre los dos cambió código de lo que se despliega.
+    else if (p.codigo === 'distinto') poner('alta', 'produccion', `Producción corre ${p.commit} y ${repo.origen.rama} está en ${principal}: entre los dos cambió código de lo que se despliega.`, desdeVisto(`produccion:${p.commit}`), { codigo: 'distinto', produccion: p.commit, principal })
+    else if (p.codigo === 'no comparable') poner('media', 'produccion', `Producción corre ${p.commit}, que no está en este clon: no comparable con ${repo.origen.rama} (${principal}).`, desdeVisto(`produccion:${p.commit}`), { codigo: 'no comparable', produccion: p.commit, principal })
   }
 
   // Una issue con trabajo en dos árboles. Es una pregunta, no una alarma, salvo que los dos tocaran los mismos ficheros.
@@ -1103,30 +1151,51 @@ export function cuellosDe(medido, ahora, vistos = { antes: {}, ahora: {} }) {
   }
 
   // Un aviso por árbol: si es una pieza que espera o trabajo a medias, y lo que tenga en el stash, en la misma frase.
+  // Las piezas que esperan más de DIAS_PIEZA_VIEJA días son deuda real, pero van juntas en un aviso: no tapan lo de hoy.
   const conAviso = new Set()
+  const viejas = []
+  const vigentes = new Set(repo.control.asignaciones.filter(x => x.estado === 'vigente').map(x => x.issue))
   for (const a of interno.todos) {
     if (a.efimero || a.falta || a.antigua) continue
     const commitMs = interno.commitMs.get(a.ruta)
     const minCommit = commitMs ? (ahora - commitMs) / MIN : null
     const enStash = a.stash > 0 ? `${a.stash} ${a.stash === 1 ? 'entrada' : 'entradas'} en el stash` : ''
+    const clave = interno.claves.get(a.ruta)
+    const quien = { rama: a.rama, trabajador: a.principal ? 'sesión principal' : a.trabajador, issue: a.issue, principal: a.principal, externo: !a.principal && clave !== null && clave !== 'claude', asignada: a.issue !== null && vigentes.has(a.issue) }
     if ((a.sin_confirmar ?? 0) > 0 && minCommit !== null && minCommit > MIN_SIN_CONFIRMAR) {
       const reciente = a.mas_reciente ? `; el más reciente, tocado hace ${hace(a.mas_reciente.hace_min)}` : ''
-      poner('media', 'sin-confirmar', `${etiqueta(a)} tiene trabajo sin confirmar: ${a.sin_confirmar} ${a.sin_confirmar === 1 ? 'fichero' : 'ficheros'}${reciente}${enStash ? `, y ${enStash}` : ''}. Su último commit es de hace ${hace(minCommit)}. No significa que esté parado.`, commitMs)
+      poner('media', 'sin-confirmar', `${etiqueta(a)} tiene trabajo sin confirmar: ${a.sin_confirmar} ${a.sin_confirmar === 1 ? 'fichero' : 'ficheros'}${reciente}${enStash ? `, y ${enStash}` : ''}. Su último commit es de hace ${hace(minCommit)}. No significa que esté parado.`, commitMs, { ...quien, sin_confirmar: a.sin_confirmar, stash: a.stash, sin_moverse_min: Math.round(a.actividad_hace_min ?? minCommit), sin_moverse: (a.actividad_hace_min ?? minCommit) > MIN_SIN_CONFIRMAR })
       if (a.rama) conAviso.add(a.rama)
     } else if ((a.delante ?? 0) > 0 && a.sin_confirmar === 0 && minCommit !== null && minCommit > MIN_SIN_INTEGRAR) {
       // En el árbol principal sólo cuentan los commits de hoy: lo que lleva días sin empujar es una decisión, no un olvido.
       const deHoy = a.principal ? repo.integracion.sin_integrar.por_rama.find(x => x.rama === a.rama)?.de_hoy ?? 0 : null
       if (a.principal && !deHoy) continue
+      const datos = { ...quien, commits: a.principal ? deHoy : a.delante, espera_min: Math.round(minCommit), p95_min: p95.p95_min, n: p95.n, stash: a.stash }
+      if (a.rama) conAviso.add(a.rama)
+      if (!a.principal && minCommit > DIAS_PIEZA_VIEJA * 24 * 60) {
+        viejas.push({ a, commitMs, minCommit, datos })
+        continue
+      }
       const que = a.principal
         ? `${a.rama ?? 'El árbol principal'} local lleva ${deHoy} ${deHoy === 1 ? 'commit de hoy' : 'commits de hoy'} sin empujar a ${repo.origen.rama}; el último, hace ${hace(minCommit)}`
         : `Pieza terminada sin integrar: ${etiqueta(a)} lleva ${a.delante} commits por delante de ${repo.origen.rama}, árbol limpio, esperando hace ${hace(minCommit)}`
-      poner('media', 'pieza', `${que}${enStash ? `; además tiene ${enStash}` : ''}.`, commitMs)
+      poner('media', 'pieza', `${que}${enStash ? `; además tiene ${enStash}` : ''}.`, commitMs, datos)
+    } else if (a.stash > 0 && !a.principal && clave !== null && clave !== 'claude') {
+      // Sólo stash, en el árbol de un trabajador externo: es trabajo a medias, y el control tiene que saber de quién.
+      poner('media', 'stash', `La rama ${a.rama} tiene ${enStash}: trabajo guardado que no está en ningún commit.`, interno.stashMs.get(a.rama) ?? ahora, { ...quien, sin_confirmar: 0, stash: a.stash, sin_moverse_min: minCommit === null ? null : Math.round(minCommit), sin_moverse: minCommit !== null && minCommit > MIN_SIN_CONFIRMAR })
       if (a.rama) conAviso.add(a.rama)
     }
   }
+  if (viejas.length === 1) {
+    const [v] = viejas
+    poner('media', 'pieza', `Pieza terminada sin integrar: ${etiqueta(v.a)} lleva ${v.a.delante} commits por delante de ${repo.origen.rama}, árbol limpio, esperando hace ${hace(v.minCommit)}${v.a.stash > 0 ? `; además tiene ${v.a.stash} en el stash` : ''}.`, v.commitMs, v.datos)
+  } else if (viejas.length > 1) {
+    viejas.sort((x, y) => x.minCommit - y.minCommit)
+    poner('media', 'piezas-viejas', `${viejas.length} ramas terminadas hace más de ${DIAS_PIEZA_VIEJA} días sin integrar: ${viejas.map(v => `${v.a.rama} (${v.a.delante} commits, hace ${hace(v.minCommit)})`).join(', ')}.`, Math.min(...viejas.map(v => v.commitMs)), { piezas: viejas.map(v => v.datos) })
+  }
   for (const s of repo.stash) {
     if (s.antigua || conAviso.has(s.rama)) continue
-    poner('media', 'stash', `La rama ${s.rama} tiene ${s.entradas} ${s.entradas === 1 ? 'entrada' : 'entradas'} en el stash: trabajo guardado que no está en ningún commit.`, interno.stashMs.get(s.rama) ?? ahora)
+    poner('media', 'stash', `La rama ${s.rama} tiene ${s.entradas} ${s.entradas === 1 ? 'entrada' : 'entradas'} en el stash: trabajo guardado que no está en ningún commit.`, interno.stashMs.get(s.rama) ?? ahora, { rama: s.rama, stash: s.entradas, externo: false })
   }
 
   return cuellos
@@ -1432,6 +1501,7 @@ function pintor(datos) {
       } else p.push('<p>0 issues asignadas en lo declarado.</p>')
       p.push(`<p>Fuera: ${c.fuera.length ? c.fuera.map(escapar).join(', ') : 'nadie'} · última decisión escrita: ${c.local_ms ? relativo(c.local_ms, ahora) : escapar(c.local)} (el control sólo reescribe cuando su decisión cambia: la edad sola no indica nada)${c.esperas_caducadas.length ? ` · esperas declaradas que lo medido contradice: ${c.esperas_caducadas.map(n => `#${n}`).join(', ')}` : ''}</p>`)
     }
+    if (r.stash_sin_riesgo) p.push(`<p class="pie">${plural(r.stash_sin_riesgo, 'entrada del stash no avisa', 'entradas del stash no avisan')}: su contenido ya está en ${escapar(o.rama)}, o el repositorio las declara revisadas en herramientas.stash_revisados.</p>`)
     if (r.antiguas.length) {
       p.push(
         '<details>',
@@ -1499,6 +1569,11 @@ function pintor(datos) {
     const de = tipo => cuellos.filter(c => c.tipo === tipo).length
     partes.push(`<p class="pie">Detectores de esta foto, los que ve un guion sin que nadie anote nada: ${plural(de('migracion'), 'número de migración con aviso', 'números de migración con aviso')} · ${plural(de('duplicada'), 'issue con trabajo en dos árboles', 'issues con trabajo en dos árboles')} · ${plural(de('caducado'), 'espera declarada que lo medido contradice', 'esperas declaradas que lo medido contradicen')} · n = ${plural(validos.length, 'repositorio mirado', 'repositorios mirados')} · ventana: foto de las ${soloHora(ahora)} · fuente: git y lo declarado.</p>`)
   }
+
+  const dec = datos.decisiones
+  if (dec && dec.cambios > 0) {
+    partes.push(`<p>Señales que cambiaron la orden del control: ${dec.senales} en ${plural(dec.cambios, 'cambio de orden', 'cambios de orden')}; ${dec.altas} de gravedad alta. Resueltas: ${dec.resueltas} de ${dec.senales}${dec.duraciones_min.length ? `, en ${dec.mediana_min === null ? dec.duraciones_min.map(m => hace(m)).join(', ') : `${hace(dec.mediana_min)} la mitad de ellas`}` : ''}; siguen vivas ${dec.vivas}; reaparecieron ${dec.reaparecidas}. Tendencia: ${dec.dias >= 7 ? `${coma(dec.dias)} días de registro` : nm('tendencia de las señales del control', `n = ${coma(dec.dias)} días de registro, hacen falta 7: sólo conteo`)} <span class="pie">fuente: decisiones.tsv, calculado con el diario.</span></p>`)
+  } else partes.push(`<p>Señales que cambiaron la orden del control: ${nm('señales que cambiaron la orden del control', dec ? 'el registro de decisiones está vacío' : 'no hay registro de decisiones (lo escribe el control del mod cuando una señal cambia su orden) o el cálculo diario aún no lo leyó')}</p>`)
 
   // 4 · Flujo: lo calcula el guion diario (diario.mjs) y aquí sólo se lee, con su fecha.
   partes.push('<h2>Flujo · entra, sale, cuánto tarda</h2>', '<div class="met">')
@@ -1653,7 +1728,7 @@ function pintor(datos) {
             celda(escapar(r.nombre)),
             celda(!medida ? nm(`commit publicado en producción de ${r.nombre}`, motivo) : p.commit ? `<code>${p.commit}</code>` : 'la URL no publica un commit'),
             celda(!medida ? nm(`salud de producción de ${r.nombre}`, motivo) : p.bien ? '○ bien' : '■ <strong>con problemas o sin respuesta</strong>'),
-            celda(!medida || p.coincide === null ? nm(`si producción de ${r.nombre} corre el commit de la principal`, medida ? 'la URL no publica un commit' : motivo) : p.coincide ? 'sí' : '■ <strong>NO</strong>'),
+            celda(!medida || p.coincide === null ? nm(`si producción de ${r.nombre} corre el commit de la principal`, medida ? 'la URL no publica un commit' : motivo) : p.coincide ? 'sí' : p.codigo === 'igual' ? '○ al día: entre lo desplegado y la principal no cambió código' : p.codigo === 'no comparable' ? `▲ no comparable: ${escapar(p.commit)} no está en este clon` : '■ <strong>NO</strong>: cambió código de lo que se despliega'),
             celda(d.estado === 'sin medir' ? nm(`despliegue del último commit de ${r.nombre}`, motivoDeGitHub(r)) : `${escapar({ success: '○ desplegado', pending: '● pendiente', failure: '■ FALLÓ', error: '■ FALLÓ', 'sin despliegue': '■ sin despliegue' }[d.estado] ?? d.estado)} <span class="pie">${d.commit ?? ''}</span>`),
           ])
         }),
@@ -1826,7 +1901,7 @@ export async function generar(opciones = {}) {
   const cuellos = ordenar(porRepo.flat())
   const datos = {
     // Arriba del todo, a propósito: es lo primero que lee quien abre el fichero.
-    cuellos: cuellos.map(({ gravedad, tipo, que, desde, desde_ms, repositorio }) => ({ gravedad, tipo, que, desde, desde_ms, repositorio })),
+    cuellos: cuellos.map(({ gravedad, tipo, que, desde, desde_ms, repositorio, datos }) => ({ gravedad, tipo, que, desde, desde_ms, repositorio, datos })),
     foto: instante(ahora),
     foto_ms: ahora,
     duracion_ms: 0,
@@ -1838,6 +1913,7 @@ export async function generar(opciones = {}) {
   datos.duracion_ms = Date.now() - inicio
   const diario = leerJson(path.join(salida, 'diario.json'))
   datos.diario_calculado_ms = typeof diario?.calculado_ms === 'number' ? diario.calculado_ms : null
+  datos.decisiones = diario?.decisiones ?? null
   for (const repo of datos.repositorios) repo.diario = (repo.raiz && diario?.repositorios?.[repo.raiz.toLowerCase()]) || null
   const privada = paginaPrivada(datos)
   await escribir(path.join(salida, 'index.json'), privada.json)

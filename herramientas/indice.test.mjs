@@ -944,7 +944,7 @@ test('el guion sólo lanza órdenes de git que leen, y no deja rastro en el repo
   indice.ordenesDeGit.length = 0
   await correr(e, { sinPizarra: true })
   assert.ok(indice.ordenesDeGit.length > 5)
-  for (const orden of indice.ordenesDeGit) assert.match(orden, /^(worktree list|status .*|for-each-ref .*|rev-parse .*|rev-list .*|ls-remote origin|ls-tree .*|stash list|log -1|reflog show|remote get-url|diff --name-only)$/)
+  for (const orden of indice.ordenesDeGit) assert.match(orden, /^(worktree list|status .*|for-each-ref .*|rev-parse .*|rev-list .*|ls-remote origin|ls-tree .*|stash list|log -1|reflog show|remote get-url|diff --name-only|diff --quiet)$/)
   await assert.rejects(indice.git(e.raiz, ['fetch', 'origin']), /no permitida/)
   await assert.rejects(indice.git(e.raiz, ['stash', 'pop']), /no permitida/)
   await assert.rejects(indice.git(e.raiz, ['worktree', 'prune']), /no permitida/)
@@ -1080,4 +1080,145 @@ test('cincuenta árboles se miden en menos de cinco segundos', async () => {
   assert.equal(datos.repositorios[0].arboles_vistos, 50)
   assert.ok(ms < 5000, `tardó ${ms} ms`)
   console.log(`# 50 árboles: ${ms} ms`)
+})
+
+// ── 2.3.0 · Producción: otro commit no basta; tiene que haber cambiado código de lo que se despliega ──
+
+test('producción con otro commit pero sin cambio de código: no hay cuello; con cambio de código, sí; si no está en el clon, no comparable', async () => {
+  const e = escenario({ estado: { produccion: { salud: 'https://ejemplo.invalid/health' } } })
+  const desplegado = git(e.raiz, 'rev-parse', 'origin/main')
+  const salud = commit => async () => ({ status: 200, texto: JSON.stringify({ status: 'ok', commit }) })
+  // La principal avanza sólo con documentación: un .md en la raíz, otro dentro del código, y carpetas que no se despliegan.
+  confirmar(e.raiz, 'NOTAS.md', 'una nota\n')
+  confirmar(e.raiz, 'docs/guia.txt', 'una guía\n')
+  confirmar(e.raiz, 'gobernanza/acta.txt', 'un acta\n')
+  confirmar(e.raiz, 'src/LEEME.md', 'un leeme dentro del código\n')
+  git(e.raiz, 'push', '-q', 'origin', 'main')
+  let { datos, html } = await correr(e, { pedir: salud(desplegado) })
+  assert.deepEqual([datos.repositorios[0].produccion.coincide, datos.repositorios[0].produccion.codigo], [false, 'igual'])
+  assert.deepEqual(deTipo(datos, 'produccion'), [], 'commits distintos, mismo código: no es un cuello')
+  assert.match(html, /○ al día: entre lo desplegado y la principal no cambió código/)
+
+  // Ahora sí cambia código.
+  confirmar(e.raiz, 'src/app.ts', 'export const a = 1\n')
+  git(e.raiz, 'push', '-q', 'origin', 'main')
+  ;({ datos, html } = await correr(e, { pedir: salud(desplegado.slice(0, 10)) }))
+  assert.equal(datos.repositorios[0].produccion.codigo, 'distinto')
+  let [c] = deTipo(datos, 'produccion')
+  assert.equal(c.gravedad, 'alta')
+  assert.match(c.que, /^Producción corre [0-9a-f]{10} y origin\/main está en [0-9a-f]{9}: entre los dos cambió código de lo que se despliega\.$/)
+  assert.equal(c.datos.codigo, 'distinto')
+  assert.match(html, /■ <strong>NO<\/strong>: cambió código de lo que se despliega/)
+
+  // Las rutas de lo que se despliega son configurables: si sólo cuenta «api/», lo de «src/» no es un cambio.
+  confirmar(e.raiz, '.claude/orquestacion.json', JSON.stringify({ produccion: { salud: 'https://ejemplo.invalid/health', rutas: ['api'] } }))
+  git(e.raiz, 'push', '-q', 'origin', 'main')
+  ;({ datos } = await correr(e, { pedir: salud(desplegado) }))
+  assert.equal(datos.repositorios[0].produccion.codigo, 'igual')
+  assert.deepEqual(deTipo(datos, 'produccion'), [])
+
+  // Un commit que este clon no tiene no se puede comparar: gravedad media, y se dice.
+  ;({ datos, html } = await correr(e, { pedir: salud('abcdef1234') }))
+  ;[c] = deTipo(datos, 'produccion')
+  assert.equal(c.gravedad, 'media')
+  assert.match(c.que, /Producción corre abcdef1234, que no está en este clon: no comparable con origin\/main/)
+  assert.match(html, /▲ no comparable: abcdef1234 no está en este clon/)
+  // Y con el mismo commit, nada que comparar.
+  ;({ datos } = await correr(e, { pedir: salud(git(e.raiz, 'rev-parse', 'origin/main')) }))
+  assert.deepEqual([datos.repositorios[0].produccion.coincide, datos.repositorios[0].produccion.codigo], [true, 'igual'])
+  assert.deepEqual(deTipo(datos, 'produccion'), [])
+})
+
+// ── 2.3.0 · Un stash cuyo contenido ya está en la principal no es trabajo en riesgo ──────────────────
+
+test('un stash cuyo contenido ya llegó a la principal no avisa; uno declarado como revisado, tampoco; los demás, sí', async () => {
+  const e = escenario({ estado: { herramientas: { stash_revisados: ['guardado por si acaso'] } } })
+  // agy guarda un cambio…
+  fs.writeFileSync(path.join(e.agy, 'LEEME.txt'), 'plataforma\ncon una línea más\n')
+  git(e.agy, 'stash')
+  let { datos, html } = await correr(e)
+  assert.equal(deTipo(datos, 'stash').length, 1, 'todavía no está en la principal')
+  assert.equal(datos.repositorios[0].stash_sin_riesgo, 0)
+  // …y ese mismo contenido llega a la principal por otro camino.
+  confirmar(e.raiz, 'LEEME.txt', 'plataforma\ncon una línea más\n')
+  git(e.raiz, 'push', '-q', 'origin', 'main')
+  ;({ datos, html } = await correr(e))
+  assert.deepEqual(deTipo(datos, 'stash'), [])
+  assert.equal(datos.repositorios[0].stash_sin_riesgo, 1)
+  assert.equal(datos.repositorios[0].arboles.find(a => a.rama === 'agy/12').stash, 0)
+  assert.match(html, /1 entrada del stash no avisa: su contenido ya está en origin\/main, o el repositorio las declara revisadas/)
+
+  // Otro, con contenido que no está en ningún sitio, pero que el repositorio declara revisado por su mensaje.
+  fs.writeFileSync(path.join(e.codex, 'LEEME.txt'), 'otra cosa distinta\n')
+  git(e.codex, 'stash', 'push', '-q', '-m', 'guardado por si acaso')
+  ;({ datos } = await correr(e))
+  assert.deepEqual(deTipo(datos, 'stash'), [])
+  assert.equal(datos.repositorios[0].stash_sin_riesgo, 2)
+  // Y uno más, sin declarar: ése sí avisa.
+  fs.writeFileSync(path.join(e.codex, 'LEEME.txt'), 'y otra más\n')
+  git(e.codex, 'stash', 'push', '-q', '-m', 'sin revisar')
+  ;({ datos } = await correr(e))
+  assert.equal(deTipo(datos, 'stash').length, 1)
+  assert.match(deTipo(datos, 'stash')[0].que, /codex\/34 tiene 1 entrada en el stash/)
+})
+
+// ── 2.3.0 · Las piezas viejas, juntas; y los datos que el control lee ───────────────────────────────
+
+test('las piezas terminadas hace más de 2 días van en un solo aviso; la de hoy, en el suyo, con los datos para el control', async () => {
+  const e = escenario({ estado: { cola: [12] } })
+  escribir(e.raiz, '.claude/orquestacion.local.json', JSON.stringify({ asignaciones: { 12: { trabajador: 'agy', estado: 'vigente' } } }))
+  confirmar(e.agy, 'pieza.txt', 'x\n')
+  confirmar(e.codex, 'pieza.txt', 'x\n')
+  git(e.raiz, 'worktree', 'add', '-q', '-b', 'beta/56', `${e.dir}/plataforma-beta`)
+  confirmar(`${e.dir}/plataforma-beta`, 'pieza.txt', 'x\n')
+  // Hoy (40 minutos después): tres piezas recientes, cada una con su aviso.
+  let { datos } = await correr(e, { ahora: en40(), sinRed: true })
+  assert.equal(deTipo(datos, 'pieza').length, 3)
+  assert.deepEqual(deTipo(datos, 'piezas-viejas'), [])
+  const deAgy = deTipo(datos, 'pieza').find(c => /agy\/12/.test(c.que))
+  assert.deepEqual({ ...deAgy.datos, espera_min: null }, { rama: 'agy/12', trabajador: 'agy', issue: 12, principal: false, externo: true, asignada: true, commits: 1, espera_min: null, p95_min: null, n: 0, stash: 0 })
+  assert.ok(deAgy.datos.espera_min >= 39 && deAgy.datos.espera_min <= 41)
+
+  // Tres días después: son deuda real y siguen saliendo, pero en un solo aviso que no tapa lo de hoy.
+  const en3dias = Date.now() + 3 * 24 * 60 * MINUTO
+  ;({ datos } = await correr(e, { ahora: en3dias, sinRed: true }))
+  assert.deepEqual(deTipo(datos, 'pieza'), [])
+  const [juntas] = deTipo(datos, 'piezas-viejas')
+  assert.equal(juntas.gravedad, 'media')
+  assert.match(juntas.que, /^3 ramas terminadas hace más de 2 días sin integrar: (agy\/12|codex\/34|beta\/56) \(1 commits, hace 3 días\), (agy\/12|codex\/34|beta\/56) \(1 commits, hace 3 días\), (agy\/12|codex\/34|beta\/56) \(1 commits, hace 3 días\)\.$/)
+  assert.deepEqual(juntas.datos.piezas.map(p => p.rama).sort(), ['agy/12', 'beta/56', 'codex/34'])
+  assert.equal(datos.cuellos.length, 1)
+  // Una pieza de hoy junto a las viejas: sale la suya primero, y las viejas, agrupadas, después.
+  git(e.raiz, 'worktree', 'add', '-q', '-b', 'gama/78', `${e.dir}/plataforma-gama`)
+  const hace45 = new Date(en3dias - 45 * MINUTO).toISOString()
+  execFileSync('git', ['-C', `${e.dir}/plataforma-gama`, 'commit', '-q', '--allow-empty', '-m', 'pieza de hoy', '--date', hace45], { env: { ...entorno(), GIT_COMMITTER_DATE: hace45 } })
+  ;({ datos } = await correr(e, { ahora: en3dias, sinRed: true }))
+  assert.deepEqual(datos.cuellos.map(c => c.tipo), ['pieza', 'piezas-viejas'])
+  assert.match(datos.cuellos[0].que, /gama\/78/)
+  // Una sola pieza vieja no se «agrupa»: sale como lo que es.
+  const una = escenario()
+  confirmar(una.agy, 'pieza.txt', 'x\n')
+  ;({ datos } = await correr(una, { ahora: en3dias, sinRed: true }))
+  assert.deepEqual(datos.cuellos.map(c => c.tipo), ['pieza'])
+})
+
+test('cada árbol lleva su estado en palabras y la foto dice qué issues siguen abiertas: es lo que lee el panel del mod', async () => {
+  const e = escenario()
+  escribir(e.agy, 'a-medias.txt', 'x\n')
+  const nodo = number => ({ number, labels: { nodes: [] } })
+  const g = github(e, [
+    ['api.github.com/user', { status: 200, texto: '{}' }],
+    ['api.github.com/graphql', { status: 200, texto: JSON.stringify({ data: { repository: { issues: { totalCount: 2, nodes: [nodo(12), nodo(34)] } }, search: { issueCount: 0 } } }) }],
+  ])
+  const { datos } = await correr(e, { raices: undefined, pedir: g.pedir, ahora: en40() })
+  assert.deepEqual(datos.repositorios[0].arboles.map(a => [a.rama, a.forma, a.estado]), [
+    ['main', '○', 'sin cambios locales y sin commits por delante'], // el .env de la credencial está en .gitignore
+    ['agy/12', '■', 'tiene trabajo a medias'],
+    ['codex/34', '○', 'sin cambios locales y sin commits por delante'],
+  ])
+  assert.deepEqual(datos.repositorios[0].github.abiertas_numeros, [12, 34])
+  assert.equal(datos.repositorios[0].integracion.sin_integrar.mas_viejo_de_hoy_ms, null, 'sin commits de hoy esperando')
+  // La señal de trabajo a medias de un externo lleva lo que el control necesita para no reasignarlo.
+  const c = deTipo(datos, 'sin-confirmar').find(x => x.datos.rama === 'agy/12')
+  assert.deepEqual([c.datos.trabajador, c.datos.externo, c.datos.sin_confirmar, c.datos.sin_moverse], ['agy', true, 1, true])
 })

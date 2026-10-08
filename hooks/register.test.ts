@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { MOTIVO_A_MEDIAS, enrutar, pesar, tabla } from './router'
-import type { Actividad, Issue } from './router'
+import { costoPorConstruida, leerFoto } from './panel'
+import { MOTIVO_A_MEDIAS, causasDe, enrutar, orden, pesar, tabla } from './router'
+import type { Actividad, Estado, Issue, Senal } from './router'
 
 const props = { title: 'Consumo', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as const
 const viewport = { columns: 160, rows: 64, isFullscreen: true }
@@ -15,7 +16,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await pane.find({ text: /Presupuesto 200 USD/ })).toBeDefined()
     expect(await pane.find({ text: /Autonomía/ })).toBeDefined()
     expect(await pane.find({ text: /Avance real/ })).toBeDefined()
-    expect(await pane.find({ text: /3 · ¿Quién tiene cada issue/ })).toBeDefined()
+    // 2.3.0: el panel ya no va en tres preguntas numeradas; la orden y «quién está en qué» son bloques propios.
+    expect(await pane.find({ text: /La orden del próximo despertar/ })).toBeDefined()
+    expect(await pane.find({ text: /Quién está en qué/ })).toBeDefined()
+    expect(await pane.find({ text: /La sesión/ })).toBeDefined()
     expect(await pane.find({ text: /Pendiente en GitHub/ })).toBeDefined()
     expect(await pane.find({ text: /Cobertura de pruebas/ })).toBeDefined()
     expect(await pane.find({ type: 'Button', text: /Actualizar/ })).toBeDefined()
@@ -84,11 +88,18 @@ test('con una medición, el avance real muestra cierres, factura y la semana sin
   expect(JSON.stringify(respuesta)).toContain('132 issues cerradas')
   const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
   expect(await pane.find({ text: /Avance real · acme\/plataforma · desde el 31-08/ })).toBeDefined()
-  expect(await pane.find({ text: /132 cerradas · 5 descartadas · 209 creadas · 72 abiertas hoy/ })).toBeDefined()
-  expect(await pane.find({ text: /este proyecto ≈ 111 USD \(46\.5 %\)/ })).toBeDefined()
-  expect(await pane.find({ text: /0\.84 USD por issue cerrada/ })).toBeDefined()
-  expect(await pane.find({ text: /Esta semana: ≈ 11 USD de consumo y ninguna issue cerrada \(21 creadas\)/ })).toBeDefined()
+  expect(await pane.find({ text: /este proyecto ≈ 111 USD \(46\.5 % del consumo de esta máquina\)/ })).toBeDefined()
   expect(await pane.find({ text: /73 despertares del bucle, 32 sin cambios/ })).toBeDefined()
+  // 2.3.0: lo que el análisis demostró engañoso sale del panel. Las issues, los cierres por semana y el flujo los
+  // mide el guion del index, y el costo se da por issue CONSTRUIDA y acumulado, nunca por semana ni por cerrada.
+  expect(JSON.stringify(respuesta)).not.toContain('por issue cerrada')
+  expect(JSON.stringify(respuesta)).not.toContain('semanas')
+  expect(await pane.find({ text: /por issue cerrada/ })).toBeUndefined()
+  expect(await pane.find({ text: /Proyección|cierres y .* altas por semana|≈ \d+ semanas/ })).toBeUndefined()
+  expect(await pane.find({ text: /Esta semana: ≈/ })).toBeUndefined()
+  expect(await pane.find({ text: /132 cerradas · 5 descartadas/ })).toBeUndefined()
+  // Sin el cálculo diario no hay denominador: el costo dice NO MEDIDO y por qué, no una cifra.
+  expect(await pane.find({ text: /Costo por issue construida: NO MEDIDO \(falta el cálculo diario/ })).toBeDefined()
 })
 
 // ── El control ──────────────────────────────────────────────────────────────────────────────────────
@@ -108,7 +119,7 @@ function repositorioDePrueba(
   on: unknown,
   issues: IssueDePrueba[],
   estado: Record<string, unknown>,
-  extra: { medicion?: unknown; salud?: string; herramientas?: Record<string, string> | null; existen?: string[]; vivo?: unknown; candado?: string; git?: (argv: readonly string[]) => string | null } = {},
+  extra: { medicion?: unknown; salud?: string; herramientas?: Record<string, string> | null; existen?: string[]; vivo?: unknown; diario?: unknown; candado?: string; git?: (argv: readonly string[]) => string | null } = {},
 ): { escrito: () => any; versionado: () => any; local: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[]; corridas: () => string[][] } {
   const otros: Record<string, string> = {}
   const urls: string[] = []
@@ -136,13 +147,17 @@ function repositorioDePrueba(
   contestar('fs.exists', (_$, e) => {
     if (roto) throw new Error('disco caído')
     const ruta = barrasNormales(e.path)
-    if (extra.vivo !== undefined && ruta === `${CARPETA_VIVO}/indice.mjs`) return { value: true }
+    if (extra.vivo !== undefined && (ruta === `${CARPETA_VIVO}/indice.mjs` || ruta === `${CARPETA_VIVO}/index.json`)) return { value: true }
+    if (extra.diario !== undefined && ruta === `${CARPETA_VIVO}/diario.json`) return { value: true }
+    if (ruta in otros) return { value: true }
     if ((extra.existen ?? []).some(x => ruta.endsWith(x))) return { value: true }
     return { value: esLocal(e.path) ? delControl !== '' : /orquestacion\.json$/.test(String(e.path)) }
   })
   contestar('fs.read', (_$, e) => {
     const ruta = barrasNormales(e.path)
     if (extra.vivo !== undefined && ruta === `${CARPETA_VIVO}/index.json`) return { value: JSON.stringify(extra.vivo) }
+    if (extra.diario !== undefined && ruta === `${CARPETA_VIVO}/diario.json`) return { value: JSON.stringify(extra.diario) }
+    if (ruta in otros) return { value: otros[ruta] }
     if (extra.candado !== undefined && (extra.existen ?? []).some(x => ruta.endsWith(x))) return { value: extra.candado }
     return { value: esLocal(e.path) ? delControl : guardado }
   })
@@ -300,14 +315,18 @@ test('un trabajador en fuera no recibe nada, ni como revisor de un peso L', asyn
   expect(rechazo).toContain('codex está fuera (sin cuota)')
 })
 
-test('el panel se lee en tres preguntas y la tercera es la orden del control', async ($, on) => {
+test('el panel pone la orden del control y lo declarado antes que la sesión, que va al final', async ($, on) => {
   repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] })
   await $.command.run({ command: 'consumo', args: 'agentes' } as never)
   const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
-  expect(await pane.find({ text: /1 · ¿Cuánto queda de presupuesto y de contexto\?/ })).toBeDefined()
-  expect(await pane.find({ text: /2 · ¿Esta semana se cierra trabajo o sólo se gasta\?/ })).toBeDefined()
-  expect(await pane.find({ text: /3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar\?/ })).toBeDefined()
-  expect(await pane.find({ text: /Esta sesión tiene la #346/ })).toBeDefined()
+  expect(await pane.find({ text: /La orden del próximo despertar · decidida/ })).toBeDefined()
+  expect(await pane.find({ text: /Orden: parar\. La #346 es de esta sesión/ })).toBeDefined()
+  // Sin index instalado no hay foto: lo que se enseña es lo declarado, y se dice que lo es.
+  expect(await pane.find({ text: /Quién está en qué · sin foto vigente, sólo lo declarado/ })).toBeDefined()
+  expect(await pane.find({ text: /Declarado: Esta sesión tiene la #346/ })).toBeDefined()
+  expect(await pane.find({ text: /La sesión · / })).toBeDefined()
+  expect(await pane.find({ text: /Cuellos de botella/ })).toBeUndefined()
+  expect(await pane.find({ text: /^Flujo$/ })).toBeUndefined()
 })
 
 // Un repositorio configurado a mano manda sobre el detectado y se ve en el título del avance.
@@ -727,7 +746,10 @@ const INDEX_VIVO = {
     { gravedad: 'media', tipo: 'stash', que: 'La rama agy/12 tiene 1 entrada en el stash.', desde: '2026-05-28 19:00 UTC', repositorio: 'plataforma' },
   ],
   foto: '2026-05-28 20:26 UTC',
-  repositorios: [],
+  // Un minuto antes del reloj de la prueba: es una foto vigente.
+  foto_ms: 1_780_000_000_000 - 60_000,
+  version: '2.3.0',
+  repositorios: [{ nombre: 'plataforma', raiz: 'F:/proyecto', arboles: [], control: { asignaciones: [], fuera: [], esperas_caducadas: [] }, github: { credencial: { estado: 'sin declarar' } }, integracion: { medido: false }, incidentes: null }],
 }
 
 test('con el guion instalado, el mod lo lanza y la tercera pregunta añade una línea con el primer cuello y la ruta del index', async ($, on) => {
@@ -738,7 +760,12 @@ test('con el guion instalado, el mod lo lanza y la tercera pregunta añade una l
   expect(Object.keys(repo.archivos()).some(ruta => ruta.endsWith('index.html') || ruta.endsWith('index.json'))).toBe(false)
   expect(respuesta).toContain(`Index: ${CARPETA_VIVO}/index.html`)
   const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
-  expect(await pane.find({ text: /Index vivo · ALTA · El número de migración 0002 está tomado 2 veces.*\(y 1 más\) · C:\/Users\/prueba\/\.claude\/consumo-index\/index\.html/ })).toBeDefined()
+  // 2.3.0: el panel lee la foto entera, no sólo el primer cuello.
+  expect(await pane.find({ text: /Foto de las \d\d:\d\d · hace 60 s · plataforma/ })).toBeDefined()
+  expect(await pane.find({ text: /Cuellos de botella · 2 \(1 de gravedad alta\)/ })).toBeDefined()
+  expect(await pane.find({ text: /ALTA · El número de migración 0002 está tomado 2 veces/ })).toBeDefined()
+  expect(await pane.find({ text: /MEDIA · La rama agy\/12 tiene 1 entrada en el stash/ })).toBeDefined()
+  expect(await pane.find({ text: /Detalle: C:\/Users\/prueba\/\.claude\/consumo-index\/index\.html/ })).toBeDefined()
   expect(await pane.find({ text: /Index vivo sin instalar/ })).toBeUndefined()
 })
 
@@ -762,4 +789,283 @@ test('los cuellos de botella no van al prompt de sistema: sólo al panel', async
   expect(compuesto).toContain('#346')
   expect(compuesto).not.toContain('migración 0002')
   expect(compuesto).not.toContain('cuello')
+})
+
+// ── 2.3.0 · El control escucha: la orden sale de las señales ────────────────────────────────────────
+const ESTADO_BASE: Estado = {
+  cola: [346],
+  asignaciones: { '346': { trabajador: 'claude', clase: 'Construcción', puntos: 1, peso: 'S', esfuerzo: 'medio', estado: 'vigente', desde: '2026-05-28T18:00:00.000Z', motivo: 'primera de la cola' }, '12': { trabajador: 'agy', clase: 'Construcción', puntos: 2, peso: 'M', esfuerzo: 'alto', estado: 'vigente', desde: '2026-05-28T18:00:00.000Z', motivo: 'peso M', rama: 'agy/12' } },
+  declarado: { '346': { pasos: [{ paso: 'retirar el botón', hecho: false }], criterio: 'la pantalla ya no ofrece el botón' } },
+}
+const senal = (tipo: string, gravedad: 'alta' | 'media', datos: Record<string, unknown>, que = `señal de ${tipo}`): Senal => ({ tipo, gravedad, que, datos })
+const CREDENCIAL = senal('credencial', 'alta', { http: 401, hora: '2026-05-28 20:20 UTC' })
+const REMOTO = senal('remoto', 'alta', { de: 'aaaaaaa', a: 'bbbbbbb', sesion: true })
+const MIGRACION = senal('migracion', 'alta', { numero: '0087', ramas: ['claude/346', 'agy/12'], issues: [346, 12], sesion: false }, 'El número de migración 0087 está tomado 2 veces')
+const PRODUCCION = senal('produccion', 'alta', { codigo: 'distinto', produccion: 'ccccccc', principal: 'ddddddd' })
+const PIEZA = senal('pieza', 'media', { rama: 'agy/12', trabajador: 'agy', issue: 12, principal: false, externo: true, espera_min: 130, p95_min: 52, n: 211 })
+const A_MEDIAS = senal('sin-confirmar', 'media', { rama: 'codex/34', trabajador: 'codex', issue: 34, externo: true, sin_confirmar: 3, stash: 1, sin_moverse: true, sin_moverse_min: 95 })
+
+test('sin señales, la orden es la de siempre: la issue, su primer paso sin hacer, el criterio y los archivos', () => {
+  const o = orden(ESTADO_BASE)
+  expect(o.texto).toContain('Orden: issue #346.')
+  expect(o.texto).toContain('Siguiente paso: retirar el botón')
+  expect(o.causas).toEqual([])
+  expect(o.parar).toBe(false)
+  expect(orden(ESTADO_BASE, []).texto).toBe(o.texto)
+  // Una señal que no afecta a esta sesión tampoco la cambia.
+  const ajenas = [senal('remoto', 'alta', { sesion: false }), senal('migracion', 'alta', { numero: '0090', issues: [999], sesion: false }), senal('produccion', 'alta', { codigo: 'caida' }), senal('produccion', 'media', { codigo: 'no comparable' }), senal('stash', 'media', { rama: 'main', stash: 2, externo: false }), senal('duplicada', 'media', {}), senal('hueco', 'alta', { hueco_min: 90 })]
+  expect(orden(ESTADO_BASE, ajenas).texto).toBe(o.texto)
+})
+
+test('regla 1 · credencial rechazada: parar lo que dependa de GitHub y pedirla, con la prueba', () => {
+  const o = orden(ESTADO_BASE, [CREDENCIAL])
+  expect(o.texto).toContain('1. Parar lo que dependa de GitHub. Pedir la credencial al dueño ahora, con la prueba (código HTTP y hora). Seguir sólo con lo que no la necesite.')
+  expect(o.texto).toContain('porque: GitHub respondió 401 a la credencial declarada, medido el 2026-05-28 20:20 UTC')
+  expect(o.texto).toContain('Orden: terminar antes que empezar.')
+  expect(o.texto).toContain('Después, y sólo con lo anterior resuelto: la issue #346, paso «retirar el botón».')
+  expect(o.causas.map(c => c.regla)).toEqual(['credencial'])
+})
+
+test('regla 2 · remoto movido bajo un árbol de esta sesión con trabajo: traerlo antes de verificar o empujar', () => {
+  const o = orden(ESTADO_BASE, [REMOTO])
+  expect(o.texto).toContain('1. Antes de verificar o empujar: traer el remoto y volver a medir.')
+  expect(o.texto).toContain('porque: el remoto movió la rama principal (aaaaaaa → bbbbbbb) y esta sesión tiene trabajo debajo')
+})
+
+test('regla 3 · migración repetida o sin reserva que afecta a una issue de esta sesión: reservar o renumerar', () => {
+  const o = orden(ESTADO_BASE, [MIGRACION])
+  expect(o.texto).toContain('1. Reservar o renumerar antes de seguir; no encargar otra migración hasta que cuadre.')
+  expect(o.texto).toContain('porque: migración 0087: El número de migración 0087 está tomado 2 veces')
+  // La misma señal sobre issues de otros no manda aquí; en el árbol de la sesión, sí.
+  expect(orden(ESTADO_BASE, [senal('migracion', 'alta', { numero: '0087', issues: [12], sesion: false })]).causas).toEqual([])
+  expect(orden(ESTADO_BASE, [senal('migracion', 'alta', { numero: '0087', issues: [], sesion: true })]).causas.length).toBe(1)
+})
+
+test('regla 4 · producción con código distinto del de la principal: desplegar, en orden', () => {
+  const o = orden(ESTADO_BASE, [PRODUCCION])
+  expect(o.texto).toContain('1. Desplegar, en orden: migraciones, API, web.')
+  expect(o.texto).toContain('porque: producción corre ccccccc y la rama principal está en ddddddd; entre los dos cambió código de lo que se despliega')
+})
+
+test('regla 5 · pieza terminada de una asignación vigente que espera más que el P95: integrarla antes de construir', () => {
+  const o = orden(ESTADO_BASE, [PIEZA])
+  expect(o.texto).toContain('1. Integrar agy/12 antes de construir nada nuevo.')
+  expect(o.texto).toContain('porque: pieza terminada hace 2 h 10 min; P95 = 52 min, n = 211')
+  // Por debajo del P95, sin P95 (pocos empujes), o de una issue que no es una asignación vigente: no manda.
+  const con = (datos: Record<string, unknown>) => orden(ESTADO_BASE, [senal('pieza', 'media', { ...PIEZA.datos, ...datos })]).causas
+  expect(con({ espera_min: 40 })).toEqual([])
+  expect(con({ p95_min: null })).toEqual([])
+  expect(con({ issue: 999 })).toEqual([])
+  // Las piezas viejas agrupadas en un solo aviso se miran una a una.
+  const viejas = orden(ESTADO_BASE, [senal('piezas-viejas', 'media', { piezas: [{ ...PIEZA.datos, espera_min: 4000 }, { rama: 'ci/algo', issue: null, principal: false, espera_min: 5000, p95_min: 52, n: 211 }] })])
+  expect(viejas.causas.map(c => c.clave)).toEqual(['agy/12'])
+  expect(viejas.texto).toContain('pieza terminada hace 2 días; P95 = 52 min, n = 211')
+})
+
+test('regla 6 · trabajador externo con trabajo a medias y sin moverse: preguntar al dueño, no reasignar', () => {
+  const o = orden(ESTADO_BASE, [A_MEDIAS])
+  expect(o.texto).toContain('1. Preguntar al dueño por codex; no reasignar.')
+  expect(o.texto).toContain('porque: codex tiene 3 ficheros sin confirmar y 1 entradas en el stash en codex/34 y no se mueve hace 1 h 35 min')
+  // Si se está moviendo (ficheros recién tocados), o es el árbol de esta sesión, no manda.
+  expect(orden(ESTADO_BASE, [senal('sin-confirmar', 'media', { ...A_MEDIAS.datos, sin_moverse: false })]).causas).toEqual([])
+  expect(orden(ESTADO_BASE, [senal('sin-confirmar', 'media', { ...A_MEDIAS.datos, externo: false })]).causas).toEqual([])
+})
+
+test('con varias señales manda la de más prioridad, y la orden lista hasta tres en ese orden', () => {
+  const dos = orden(ESTADO_BASE, [PIEZA, CREDENCIAL])
+  expect(dos.causas.map(c => c.regla)).toEqual(['credencial', 'pieza'])
+  expect(dos.texto.indexOf('1. Parar lo que dependa de GitHub')).toBeGreaterThan(-1)
+  expect(dos.texto.indexOf('2. Integrar agy/12')).toBeGreaterThan(dos.texto.indexOf('1. Parar lo que dependa de GitHub'))
+  // Las seis a la vez, desordenadas: salen las tres primeras de la lista de prioridad.
+  const todas = orden(ESTADO_BASE, [A_MEDIAS, PIEZA, PRODUCCION, MIGRACION, REMOTO, CREDENCIAL])
+  expect(todas.causas.map(c => c.regla)).toEqual(['credencial', 'remoto', 'migracion'])
+  expect(todas.texto).not.toContain('Desplegar, en orden')
+  expect(causasDe(ESTADO_BASE, [PRODUCCION, MIGRACION]).map(c => c.regla)).toEqual(['migracion', 'produccion'])
+})
+
+test('la firma de la orden no cambia cuando sólo pasa el tiempo, y sí cuando cambia la señal', () => {
+  const a = orden(ESTADO_BASE, [PIEZA])
+  const mastarde = orden(ESTADO_BASE, [senal('pieza', 'media', { ...PIEZA.datos, espera_min: 190 })])
+  expect(mastarde.texto).not.toBe(a.texto)
+  expect(mastarde.firma).toBe(a.firma)
+  expect(orden(ESTADO_BASE, [PIEZA, CREDENCIAL]).firma).not.toBe(a.firma)
+  expect(orden(ESTADO_BASE).firma).not.toBe(a.firma)
+})
+
+// ── 2.3.0 · El panel lee la foto: una sola fuente de verdad ──────────────────────────────────────────
+const AHORA_MS = 1_780_000_000_000
+const arbol = (extra: Record<string, unknown>) => ({ ruta: 'F:/proyecto-x', rama: 'x', principal: false, efimero: false, trabajador: null, issue: null, sin_confirmar: 0, mas_reciente: null, delante: 0, detras: 0, stash: 0, estado: 'sin cambios locales y sin commits por delante', forma: '○', ...extra })
+const FOTO_VIVA = {
+  cuellos: [
+    { gravedad: 'media', tipo: 'pieza', que: 'Pieza terminada sin integrar: agy (agy/12) lleva 3 commits por delante de origin/main, árbol limpio, esperando hace 2 h 10 min.', desde: '2026-05-28 18:16 UTC', repositorio: 'plataforma', datos: PIEZA.datos },
+    { gravedad: 'alta', tipo: 'credencial', que: 'GitHub rechazó la credencial declarada (401): issues y despliegue quedan sin medir hasta renovarla.', desde: '2026-05-28 20:20 UTC', repositorio: 'plataforma', datos: CREDENCIAL.datos },
+    { gravedad: 'alta', tipo: 'migracion', que: 'Un aviso de OTRO repositorio que aquí no debe salir.', desde: '2026-05-28 20:20 UTC', repositorio: 'otro', datos: {} },
+  ],
+  foto_ms: AHORA_MS - 40_000,
+  version: '2.3.0',
+  sin_red: false,
+  repositorios: [
+    {
+      nombre: 'plataforma',
+      raiz: 'F:/proyecto',
+      origen: { rama: 'origin/main' },
+      arboles: [
+        arbol({ ruta: 'F:/proyecto', rama: 'main', principal: true }),
+        arbol({ ruta: 'F:/proyecto-agy', rama: 'agy/12', trabajador: 'agy', issue: 12, delante: 3, estado: 'terminada, sin integrar hace 2 h 10 min (aprox.: desde su último commit)', forma: '■' }),
+        arbol({ ruta: 'F:/proyecto-codex', rama: 'codex/34', trabajador: 'codex', issue: 34, sin_confirmar: 3, mas_reciente: { fichero: 'src/a.ts', ms: AHORA_MS - 12 * 60_000 }, estado: 'trabajando', forma: '●' }),
+      ],
+      control: { asignaciones: [{ issue: 346, trabajador: 'claude', quien: 'Esta sesión' }, { issue: 12, trabajador: 'agy', quien: 'Agy' }, { issue: 77, trabajador: 'codex', quien: 'Codex' }, { issue: 55, trabajador: 'beta', quien: 'beta' }], fuera: ['beta'], esperas_caducadas: [] },
+      github: { credencial: { estado: 'vigente' }, issues_abiertas: 15, cerradas_hoy: 2, abiertas_numeros: [346, 12, 55], no_avanzan: { total: 6, denominador: 13, espera: 1, etiqueta: 5, xl: 0 } },
+      integracion: { medido: true, sin_integrar: { total: 62, de_hoy: 22, mas_viejo_de_hoy_ms: AHORA_MS - 190 * 60_000, ramas_miradas: 14 }, hueco_min: 43, sobre_el_umbral: false, umbral: { p95_min: 52, n: 211 } },
+      incidentes: { hoy: 3, en_causa_repetida: 2, dias_con_registro: 2 },
+    },
+  ],
+}
+const DIARIO = { calculado_ms: AHORA_MS - 3 * 3_600_000, repositorios: { 'f:/proyecto': { medido: true, universo: { primera_alta: '2026-03-07' }, entrega: { n: 151, p50_dias: 2.036, p85_dias: 7.548, p95_dias: 25.4 }, bloques: { cierres_en_bloque: 115, cierres: 201, bloques: 12 } } }, decisiones: { cambios: 4, senales: 3, altas: 1, resueltas: 2, vivas: 1, reaparecidas: 1, dias: 2 } }
+
+test('la foto leída: cuellos de este repositorio, quién está en qué, lo declarado caducado y el flujo con sus n', () => {
+  const l = leerFoto(FOTO_VIVA, DIARIO, 'F:\\proyecto', AHORA_MS)
+  expect(l.vigente).toBe(true)
+  expect(l.repositorio).toBe('plataforma')
+  expect(l.foto).toMatch(/^Foto de las \d\d:\d\d · hace 40 s · plataforma$/)
+  // Los de gravedad alta primero y todos; el de otro repositorio no entra.
+  expect(l.cuellos.map(c => c.gravedad)).toEqual(['ALTA', 'MEDIA'])
+  expect(l.senales.length).toBe(2)
+  expect(JSON.stringify(l)).not.toContain('OTRO repositorio')
+  expect(l.quien_titulo).toBe('Quién está en qué, medido · 2 de 3 árboles con trabajo vivo')
+  expect(l.quien).toEqual([
+    '■ terminada, sin integrar hace 2 h 10 min (aprox.: desde su último commit) · agy · #12 · agy/12 · 0 ficheros sin confirmar · 3 commits por delante',
+    '● trabajando · codex · #34 · codex/34 · 3 ficheros sin confirmar, el más reciente hace 12 min · 0 commits por delante',
+  ])
+  // La #77 ya no está abierta; la #55 es de alguien que está fuera.
+  expect(l.declarado).toEqual(['declarado, caducado: la #77 figura en manos de Codex y ya no está abierta en GitHub', 'declarado, caducado: la #55 figura en manos de beta, que está fuera'])
+  expect(l.caducadas).toEqual([77, 55])
+  expect(l.flujo).toEqual([
+    'Issues abiertas: 15; 6 de 13 no pueden avanzar solas (1 por espera declarada, 5 por etiqueta de bloqueo, 0 de peso XL sin partir) · cerradas hoy: 2 · GitHub, en esta foto',
+    expect.stringMatching(/^Tiempo de entrega: la mitad de las construidas, menos de 2,0 d; 85 de cada 100, menos de 7,5 d · n = 151 issues construidas · cálculo diario de las \d\d:\d\d$/),
+    'Sin integrar: 62 commits escritos y sin llegar a origin/main; 22 de hoy, el más viejo de hoy hace 3 h 10 min · n = 14 ramas miradas',
+    'Hueco desde el último empuje: 43 min · P95 = 52 min, n = 211',
+    expect.stringMatching(/^Cierres en bloque: 115 de 201 cierres, en 12 bloques · cálculo diario de las \d\d:\d\d$/),
+  ])
+  expect(l.coordinacion).toEqual(['Incidentes de hoy: 3; 2 de 3 son de una causa que se repite · n = 2 días de registro', 'Señales que cambiaron la orden: 3 (1 de gravedad alta); resueltas 2; reaparecieron 1 · tendencia NO MEDIDO (n = 2 días de registro, hacen falta 7): sólo conteo'])
+  // Costo: por issue construida, acumulado, con una cifra significativa y el aviso de que subestima.
+  expect(costoPorConstruida(114, '31-08', l)).toBe('≈ 0,8 USD por issue construida, acumulado (≈ 114 USD de la factura repartidos a este proyecto desde el 31-08 ÷ 151 issues construidas desde el 2026-03-07). Subestima: sólo cuenta a Claude, no a los otros agentes')
+  expect(costoPorConstruida(114, '', { ...l, construidas: 12 })).toBe('Costo por issue construida: NO MEDIDO (n = 12 issues construidas, hacen falta 30)')
+})
+
+test('con la foto vieja no se muestra nada como vigente ni hay señales para el control', () => {
+  const l = leerFoto({ ...FOTO_VIVA, foto_ms: AHORA_MS - 25 * 60_000 }, DIARIO, 'F:/proyecto', AHORA_MS)
+  expect(l.vigente).toBe(false)
+  expect(l.vieja).toMatch(/^El index no se está actualizando: la última foto es de las \d\d:\d\d, hace 25 min\. Nada de lo que medía se muestra como vigente\.$/)
+  expect([l.senales, l.cuellos, l.quien, l.flujo, l.coordinacion, l.declarado]).toEqual([[], [], [], [], [], []])
+  // Lo que falta, NO MEDIDO con su motivo; nunca un cero.
+  const sinNada = leerFoto({ ...FOTO_VIVA, repositorios: [{ ...FOTO_VIVA.repositorios[0], github: { credencial: { estado: 'sin declarar' } }, integracion: { medido: false }, incidentes: null }] }, null, 'F:/proyecto', AHORA_MS)
+  expect(sinNada.flujo).toEqual([
+    'Issues abiertas y cerradas hoy: NO MEDIDO (el repositorio no declara credencial de GitHub)',
+    'Tiempo de entrega: NO MEDIDO (el repositorio no declara credencial de GitHub, y el cálculo diario la necesita)',
+    'Sin integrar y hueco de empujes: NO MEDIDO (este clon no tiene rama principal remota)',
+    'Cierres en bloque: NO MEDIDO (el repositorio no declara credencial de GitHub, y el cálculo diario la necesita)',
+  ])
+  expect(sinNada.coordinacion).toEqual(['Incidentes de hoy: NO MEDIDO (el repositorio no tiene registro de incidentes)'])
+  // Una carpeta que el index no mide: se dice, y no hay señales.
+  expect(leerFoto(FOTO_VIVA, null, 'F:/otra-cosa', AHORA_MS).vieja).toContain('Esta carpeta no está entre los repositorios que mide el index')
+  expect(leerFoto(null, null, 'F:/proyecto', AHORA_MS).instalado).toBe(false)
+  // Una foto escrita por un guion anterior a la 2.3.0 no trae lo que el panel lee: se dice, y cómo arreglarlo.
+  expect(leerFoto(FOTO_VIVA, null, 'F:/proyecto', AHORA_MS).vieja).toBe('')
+  expect(leerFoto({ ...FOTO_VIVA, version: '2.2.0' }, null, 'F:/proyecto', AHORA_MS).vieja).toContain('La foto la escribió el guion 2.2.0 y este panel necesita la 2.3.0 o posterior')
+})
+
+const ESTADO_346 = { cola: [346], declarado: { '346': { pasos: [{ paso: 'retirar el botón', hecho: false }], criterio: 'la pantalla ya no ofrece el botón' } } }
+
+test('el panel, con una foto de prueba: los cuellos, la orden que sale de las señales y su «porque», y nada de lo engañoso', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario'), issue(12, 'Otra cosa')], { ...ESTADO_346, cola: [346, 12] }, { vivo: FOTO_VIVA, diario: DIARIO, medicion: medicionConReparto([ACME]) })
+  await $.command.run({ command: 'consumo', args: 'avance' } as never)
+  const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
+  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
+  expect(await pane.find({ text: /^Foto de las \d\d:\d\d · hace 40 s · plataforma$/ })).toBeDefined()
+  expect(await pane.find({ text: /Cuellos de botella · 2 \(1 de gravedad alta\)/ })).toBeDefined()
+  expect(await pane.find({ text: /^ALTA · GitHub rechazó la credencial declarada \(401\)/ })).toBeDefined()
+  expect(await pane.find({ text: /^MEDIA · Pieza terminada sin integrar: agy \(agy\/12\)/ })).toBeDefined()
+  // La orden ya no es «issue #346»: primero lo que las señales mandan, con su porqué.
+  expect(await pane.find({ text: /La orden del próximo despertar · decidida .* · por 1 señal del index/ })).toBeDefined()
+  expect(await pane.find({ text: /1\. Parar lo que dependa de GitHub\. Pedir la credencial al dueño ahora[\s\S]*porque: GitHub respondió 401 a la credencial declarada[\s\S]*Después, y sólo con lo anterior resuelto: la issue #346, paso «retirar el botón»/ })).toBeDefined()
+  expect(await pane.find({ text: /Quién está en qué, medido · 2 de 3 árboles con trabajo vivo/ })).toBeDefined()
+  expect(await pane.find({ text: /● trabajando · codex · #34 · codex\/34 · 3 ficheros sin confirmar, el más reciente hace 12 min/ })).toBeDefined()
+  expect(await pane.find({ text: /declarado, caducado: la #77 figura en manos de Codex y ya no está abierta en GitHub/ })).toBeDefined()
+  expect(await pane.find({ text: /Hueco desde el último empuje: 43 min · P95 = 52 min, n = 211/ })).toBeDefined()
+  expect(await pane.find({ text: /Incidentes de hoy: 3; 2 de 3 son de una causa que se repite/ })).toBeDefined()
+  expect(await pane.find({ text: /≈ 1 USD por issue construida, acumulado \(≈ 190 USD de la factura repartidos a este proyecto[^)]*÷ 151 issues construidas/ })).toBeDefined()
+  expect(await pane.find({ text: /Detalle: C:\/Users\/prueba\/\.claude\/consumo-index\/index\.html/ })).toBeDefined()
+  // Lo engañoso no está.
+  expect(await pane.find({ text: /por issue cerrada/ })).toBeUndefined()
+  expect(await pane.find({ text: /Proyección|por semana|≈ \d+ semanas/ })).toBeUndefined()
+  expect(await pane.find({ text: /…/ })).toBeUndefined()
+  expect(respuesta).not.toContain('por issue cerrada')
+  // El despertar recibe esa misma orden, no la de siempre.
+  await despertar($, 'Orquesta el cierre de todas las issues abiertas')
+  expect(repo.entro()).toContain('1. Parar lo que dependa de GitHub.')
+  expect(repo.entro()).toContain('porque: GitHub respondió 401')
+  expect(repo.entro()).not.toContain('Orquesta el cierre')
+})
+
+test('con la foto vieja, el panel lo dice en su primera línea y no enseña cuellos, flujo ni una orden por señales', async ($, on) => {
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], ESTADO_346, { vivo: { ...FOTO_VIVA, foto_ms: AHORA_MS - 25 * 60_000 }, diario: DIARIO })
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const pane = await $.ui.mount({ plugin: 'consumo', surface: 'terminal', component: 'Pane', requestId: 'consumo', props, viewport })
+  expect(await pane.find({ text: /^El index no se está actualizando: la última foto es de las \d\d:\d\d, hace 25 min\. Nada de lo que medía se muestra como vigente\.$/ })).toBeDefined()
+  expect(await pane.find({ text: /Cuellos de botella/ })).toBeUndefined()
+  expect(await pane.find({ text: /GitHub rechazó la credencial/ })).toBeUndefined()
+  expect(await pane.find({ text: /^Flujo$/ })).toBeUndefined()
+  expect(await pane.find({ text: /Issues abiertas: 15/ })).toBeUndefined()
+  expect(await pane.find({ text: /Quién está en qué · sin foto vigente, sólo lo declarado/ })).toBeDefined()
+  // El control no decide con señales viejas: la orden es la de siempre.
+  expect(await pane.find({ text: /Orden: issue #346\./ })).toBeDefined()
+  expect(await pane.find({ text: /Parar lo que dependa de GitHub/ })).toBeUndefined()
+})
+
+test('al prompt de sistema va sólo la orden, y no se reescribe cuando sólo pasa el tiempo', async ($, on) => {
+  const foto = (espera: number) => ({ ...FOTO_VIVA, cuellos: [{ ...FOTO_VIVA.cuellos[0], datos: { ...PIEZA.datos, espera_min: espera } }] })
+  const fixture: { vivo: unknown; diario: unknown } = { vivo: foto(130), diario: DIARIO }
+  // Las dos asignaciones son recientes (hace cinco minutos): la de agy sigue vigente aunque su rama no esté a la vista.
+  const reciente = new Date(AHORA_MS - 5 * 60_000).toISOString()
+  const asignaciones = Object.fromEntries(Object.entries(ESTADO_BASE.asignaciones!).map(([n, a]) => [n, { ...a, desde: reciente }]))
+  repositorioDePrueba(on, [issue(346, 'Ajustar un formulario'), issue(12, 'Otra cosa')], { ...ESTADO_346, cola: [346, 12], asignaciones }, fixture as never)
+  ;(on as unknown as (evento: string, hook: () => unknown) => void)('prompt.compose', () => ({ sections: [] }))
+  const componer = async () => JSON.stringify(await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never))
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const primero = await componer()
+  expect(primero).toContain('Integrar agy/12 antes de construir nada nuevo.')
+  expect(primero).toContain('pieza terminada hace 2 h 10 min; P95 = 52 min, n = 211')
+  // No van las señales enteras: ni la lista de cuellos ni el flujo.
+  expect(primero).not.toContain('Pieza terminada sin integrar: agy (agy/12) lleva 3 commits')
+  expect(primero).not.toContain('Issues abiertas')
+  // Una hora después la pieza sigue esperando: misma señal, otra cifra. El prompt de sistema no cambia.
+  fixture.vivo = foto(190)
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(await componer()).toBe(primero)
+  // Cuando la señal desaparece, la orden cambia y el prompt también.
+  fixture.vivo = { ...FOTO_VIVA, cuellos: [] }
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const despues = await componer()
+  expect(despues).not.toBe(primero)
+  expect(despues).toContain('Orden: issue #346.')
+})
+
+test('cada vez que una señal cambia la orden, el control lo anota en decisiones.tsv; si no cambia, no', async ($, on) => {
+  const fixture: { vivo: unknown; diario: unknown } = { vivo: FOTO_VIVA, diario: DIARIO }
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario'), issue(12, 'Otra cosa')], { ...ESTADO_346, cola: [346, 12] }, fixture as never)
+  const registro = () => repo.archivos()[`${CARPETA_VIVO}/decisiones.tsv`] ?? ''
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  const lineas = () => registro().split('\n').filter(l => l && !l.startsWith('#'))
+  expect(registro().startsWith('# fecha\trepositorio\tsenales\torden\n')).toBe(true)
+  expect(lineas().length).toBe(1)
+  expect(lineas()[0]!.split('\t').slice(1)).toEqual(['plataforma', 'alta:credencial:github', 'Parar lo que dependa de GitHub. Pedir la credencial al dueño ahora, con la prueba (código HTTP y hora). Seguir sólo con lo que no la necesite.'])
+  // La misma señal otra vez: ninguna línea nueva.
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(lineas().length).toBe(1)
+  // La señal desaparece: una línea que lo dice, para poder medir cuánto duró.
+  fixture.vivo = { ...FOTO_VIVA, cuellos: [] }
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(lineas().length).toBe(2)
+  expect(lineas()[1]!.split('\t').slice(2)).toEqual(['-', 'la orden de siempre'])
 })

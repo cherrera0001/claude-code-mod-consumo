@@ -7,21 +7,43 @@ Cruza tres fuentes que ya están en la máquina —las transcripciones locales d
 `gh`— y no envía nada a ningún servicio propio.
 
 ```
-1 · ¿Cuánto queda de presupuesto y de contexto? · sesión de 5 h 47 min · 15:05
-Presupuesto 200 USD   ████████████████████░░░░ quedan 36.73 USD (gastado el 82 %)
+Foto de las 15:04 · hace 40 s · plataforma
+
+Cuellos de botella · 2 (1 de gravedad alta)
+ALTA · GitHub rechazó la credencial declarada (401): issues y despliegue quedan sin medir hasta renovarla.
+MEDIA · Pieza terminada sin integrar: agy (agy/12) lleva 3 commits por delante de origin/main, árbol limpio, esperando hace 2 h 10 min.
+
+La orden del próximo despertar · decidida 15:04 · por 1 señal del index
+Orden: terminar antes que empezar.
+1. Parar lo que dependa de GitHub. Pedir la credencial al dueño ahora, con la prueba (código HTTP y hora). Seguir sólo con lo que no la necesite.
+   porque: GitHub respondió 401 a la credencial declarada, medido el 2026-05-28 20:20 UTC
+Después, y sólo con lo anterior resuelto: la issue #346, paso «retirar el botón».
+
+Quién está en qué, medido · 2 de 3 árboles con trabajo vivo
+■ terminada, sin integrar hace 2 h 10 min (aprox.: desde su último commit) · agy · #12 · agy/12 · 0 ficheros sin confirmar · 3 commits por delante
+● trabajando · codex · #34 · codex/34 · 3 ficheros sin confirmar, el más reciente hace 12 min · 0 commits por delante
+declarado, caducado: la #77 figura en manos de Codex y ya no está abierta en GitHub
+
+Flujo
+Issues abiertas: 15; 6 de 13 no pueden avanzar solas (1 por espera declarada, 5 por etiqueta de bloqueo, 0 de peso XL sin partir) · cerradas hoy: 2 · GitHub, en esta foto
+Tiempo de entrega: la mitad de las construidas, menos de 2,0 d; 85 de cada 100, menos de 7,5 d · n = 151 issues construidas · cálculo diario de las 12:04
+Sin integrar: 62 commits escritos y sin llegar a origin/main; 22 de hoy, el más viejo de hoy hace 3 h 10 min · n = 14 ramas miradas
+Hueco desde el último empuje: 43 min · P95 = 52 min, n = 211
+Cierres en bloque: 115 de 201 cierres, en 12 bloques · cálculo diario de las 12:04
+
+Coordinación
+Incidentes de hoy: 3; 2 de 3 son de una causa que se repite · n = 2 días de registro
+
+La sesión · 5 h 47 min · medida 15:05
+Presupuesto 200 USD   ████████████████████░░░░ quedan 36.73 USD (gastado el 82 % de 200 USD)
 Tanque de contexto    ███████████████████░░░░░ queda libre el 21 % · ocupados 786k de 1.0M
-Ritmo (última hora)   ▂▃▅▇▆▃▂▁▁▂▃▂ 28.4 USD/h
-Autonomía             1 h 17 min hasta el presupuesto, al ritmo actual
-
-2 · ¿Esta semana se cierra trabajo o sólo se gasta? · Avance real · acme/plataforma
-Sólo se gasta. Esta semana: ≈ 11 USD de consumo y ninguna issue cerrada (21 creadas)
-Issues: 132 cerradas · 5 descartadas · 209 creadas · 72 abiertas hoy
-
-3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar? · decidido 15:04
-Esta sesión tiene la #333 (Cierre), peso L, esfuerzo muy alto. El próximo despertar sigue con ella y no toma otra.
-Agy tiene la #346 (Construcción), peso M, esfuerzo alto. El próximo despertar la deja donde está si la rama agy/346 se movió en los últimos 30 minutos; si no, la marca por retomar.
-En cola: #342, #343. Espera al dueño: #325.
+≈ 0,8 USD por issue construida, acumulado (≈ 114 USD de la factura repartidos a este proyecto ÷ 151 issues construidas). Subestima: sólo cuenta a Claude, no a los otros agentes
 ```
+
+**El panel no calcula: lee.** Todo lo de arriba menos «La sesión» sale de `index.json` y `diario.json`, que el
+guion del index refresca solo. El panel los relee cada minuto. Si la foto tiene más de diez minutos, la primera
+línea lo dice en rojo y no se muestra nada como vigente; si el guion no está instalado, dice cómo instalarlo y
+enseña sólo lo declarado y la sesión.
 
 ## Integrarlo a tu repositorio en cinco pasos
 
@@ -122,6 +144,36 @@ Reglas que el control no negocia:
   tomado, el control lo dice y no lanza ninguna suite pesada.
 - Si GitHub no responde, lo dice y enruta sólo la cola escrita; no pesa a ciegas ni da nada por cerrado.
 
+### El control escucha: la orden sale de las señales
+
+La orden del próximo despertar ya no sale sólo del fichero. `orden(estado, señales)` recibe los cuellos de
+botella de la foto vigente y aplica una regla: **terminar antes que empezar**. Manda la primera que aplique, en
+este orden, y la orden lista hasta tres:
+
+| # | Señal | Orden |
+|---|---|---|
+| 1 | Credencial rechazada | Parar lo que dependa de GitHub. Pedir la credencial al dueño ahora, con la prueba (código HTTP y hora). Seguir sólo con lo que no la necesite |
+| 2 | Remoto movido bajo un árbol de esta sesión con trabajo | Antes de verificar o empujar: traer el remoto y volver a medir |
+| 3 | Número de migración repetido o sin reserva que afecta a una issue de esta sesión | Reservar o renumerar antes de seguir; no encargar otra migración hasta que cuadre |
+| 4 | Producción con código distinto del de la rama principal | Desplegar, en orden: migraciones, API, web |
+| 5 | Pieza terminada sin integrar, de una asignación vigente, que espera más que el P95 de los huecos entre empujes | Integrar esa rama antes de construir nada nuevo |
+| 6 | Trabajador externo con trabajo a medias y sin moverse | Preguntar al dueño por él; no reasignar |
+| 7 | Ninguna | La de siempre: issue, primer paso sin hacer, criterio y archivos; o parar |
+
+Cada orden lleva debajo **la señal que la causó y su número** («porque: pieza terminada hace 2 h 10 min; P95 = 52
+min, n = 211»). Una señal que no afecta a esta sesión no manda aquí. Con la foto vieja no hay señales: el control
+no decide con lo que ya no sabe si es verdad. El router sigue sin entrada ni salida: las señales las pasa quien
+llama.
+
+Al despertar del bucle le llega esa orden con las cifras de la foto. Al prompt de sistema va **sólo la orden**, y
+sólo se reescribe cuando cambian las señales que mandan, no cuando cambia la hora: reescribirla en cada foto
+rompería la caché del prompt. Si la decisión del control tiene más de diez minutos, se vuelve a tomar sola.
+
+**¿Sirve escuchar?** Cada vez que cambian las señales que mandan, el control añade una línea a
+`~/.claude/consumo-index/decisiones.tsv` (fecha, repositorio, señales, orden). El cálculo diario lo lee y dice
+cuántas señales hubo, cuánto tardó cada una en desaparecer y cuántas reaparecieron. Con menos de una semana de
+registro es sólo un conteo: la tendencia es NO MEDIDO.
+
 La decisión llega a quien trabaja por dos sitios: el fichero, y una sección del prompt de sistema que
 repite la orden vigente. Los cuellos de botella del index **no** van al prompt de sistema (cada cambio rompería
 su caché y costaría tokens): van al panel, en una línea. El control sólo actúa en un repositorio que tenga `.claude/orquestacion.json`.
@@ -174,8 +226,8 @@ Lo que tú escribes, plantilla en [`ejemplos/orquestacion.json`](ejemplos/orques
 | `fuera` | Trabajador → motivo |
 | `declarado` | Por issue: `clase`, `falta`, `solo_sesion`, las cinco respuestas del peso, y lo que arma la orden: `pasos` (lista ordenada, cada uno con `hecho`), `criterio`, `archivos` y `espera` |
 | `no_tocar` | Archivos que un trabajador externo no puede tocar |
-| `produccion` | `salud`: la URL de `/health` de la que sale la ficha pública |
-| `herramientas` | Lo propio de tu repositorio, con rutas relativas a su raíz: `gh` (el envoltorio con que se habla con GitHub; `.ps1` se lanza con PowerShell y `.sh` con bash), `candado` (el fichero del candado de suites), `migraciones` (la carpeta de migraciones; por defecto `db/migrations`), `incidentes` (el registro de incidentes; por defecto `.claude/incidentes.tsv`) y `dias_rama_antigua` (por defecto 14) |
+| `produccion` | `salud`: la URL de `/health` de la que sale la ficha pública. `rutas`: lo que se despliega, para decidir si entre lo desplegado y la principal cambió código |
+| `herramientas` | Lo propio de tu repositorio, con rutas relativas a su raíz: `gh` (el envoltorio con que se habla con GitHub; `.ps1` se lanza con PowerShell y `.sh` con bash), `candado` (el fichero del candado de suites), `migraciones` (la carpeta de migraciones; por defecto `db/migrations`), `incidentes` (el registro de incidentes; por defecto `.claude/incidentes.tsv`), `dias_rama_antigua` (por defecto 14) y `stash_revisados` (mensajes de stash que ya no avisan) |
 | `migraciones` | La tabla de reservas de números de migración (ver «El index vivo») |
 
 El mod no trae nombres de ningún producto: si `herramientas.gh` falta, lee las issues con la credencial que
@@ -293,11 +345,12 @@ Van arriba del todo, en `index.json` (`cuellos`, con `gravedad`, `que`, `desde` 
 | alta | remoto movido | el remoto movió `main` y hay un árbol con trabajo debajo |
 | alta | hueco de integración | más tiempo sin empujes que el P95 de los huecos, con commits de hoy esperando |
 | alta | sin despliegue | el último commit de `main` lleva más de 10 min sin despliegue, o el despliegue falló |
-| alta | producción | corre otro commit que `main`, o responde con problemas |
+| alta | producción | responde con problemas, o entre lo desplegado y `main` **cambió código de lo que se despliega** (`git diff --quiet` sobre `produccion.rutas`; por defecto, todo menos `gobernanza/`, `docs/`, `.claude/` y los `*.md`). Otro commit con el mismo código no avisa: «al día: entre lo desplegado y la principal no cambió código» |
+| media | producción no comparable | el commit desplegado no está en este clon |
 | media o alta | issue en dos árboles | una issue con trabajo en dos árboles: es una pregunta («confirmar que el reparto es intencionado»). Sólo es alta si los dos tocaron los mismos ficheros y ninguna rama contiene a la otra; entonces lista hasta tres |
-| media | pieza sin integrar | rama con commits por delante, árbol limpio y último commit hace más de 30 min. En el árbol principal sólo cuentan los commits de hoy |
+| media | pieza sin integrar | rama con commits por delante, árbol limpio y último commit hace más de 30 min. En el árbol principal sólo cuentan los commits de hoy. Las que esperan más de 2 días van **juntas en un solo aviso**, para que no tapen lo de hoy |
 | media | trabajo sin confirmar | ficheros sin confirmar y último commit hace más de 30 min |
-| media | stash | una rama con entradas en el stash (si esa rama ya avisa por otra cosa, va en la misma frase) |
+| media | stash | una rama con entradas en el stash (si esa rama ya avisa por otra cosa, va en la misma frase). Una entrada cuyo contenido ya está en `origin/main`, o cuyo mensaje figura en `herramientas.stash_revisados`, no es trabajo en riesgo y no avisa |
 | media | reserva vacía | una reserva en estado «reservada» sin fichero en ningún sitio tras 2 horas |
 | media | lo declarado está caducado | una `espera` declarada cuya rama ya llegó a `origin/main` |
 
@@ -380,7 +433,7 @@ Las pruebas de `herramientas/` crean sus repositorios en una carpeta temporal (u
 agentes, ramas `agy/12` y `codex/34`), no tocan la red ni crean tareas programadas. Lo que `herramientas/indice.mjs`
 porta de `hooks/indice.ts` tiene una prueba que compara las dos salidas sobre el mismo estado.
 
-La decisión (`hooks/router.ts`) y el index (`hooks/indice.ts`) no tienen entrada ni salida: todo lo que toca
+La decisión (`hooks/router.ts`), la lectura de la foto (`hooks/panel.ts`) y el index de antes (`hooks/indice.ts`) no tienen entrada ni salida: todo lo que toca
 disco, procesos o el almacén vive en `hooks/register.tsx`.
 
 Los tres guiones de `hooks/*.py` van además embebidos, tal cual, dentro de `hooks/register.tsx` (el

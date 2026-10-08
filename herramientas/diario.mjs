@@ -200,6 +200,65 @@ export function calcularDiario({ issues, commits, llegada, entradas, ahora }) {
   }
 }
 
+/**
+ * El registro de decisiones del control (decisiones.tsv): una línea cada vez que cambian las señales que mandan en
+ * la orden. De ahí sale si escuchar sirve: cuántas señales hubo, cuánto tardó cada una en desaparecer y cuántas
+ * volvieron. Con menos de una semana de registro es sólo un conteo, no una tendencia.
+ */
+export function decisionesDe(texto, ahora) {
+  const porRepo = new Map()
+  let cambios = 0
+  let primera = null
+  for (const linea of String(texto).split(/\r?\n/)) {
+    if (!linea.trim() || linea.startsWith('#')) continue
+    const [fecha, repositorio, senales] = linea.split('\t')
+    const t = Date.parse(fecha)
+    if (!Number.isFinite(t) || !repositorio || senales === undefined) continue
+    cambios++
+    if (primera === null || t < primera) primera = t
+    if (!porRepo.has(repositorio)) porRepo.set(repositorio, [])
+    porRepo.get(repositorio).push({ t, claves: senales === '-' ? [] : senales.split('|').filter(Boolean) })
+  }
+  let senales = 0
+  let altas = 0
+  let vivas = 0
+  let reaparecidas = 0
+  const duraciones = []
+  for (const lineas of porRepo.values()) {
+    lineas.sort((a, b) => a.t - b.t)
+    const abiertas = new Map()
+    const veces = new Map()
+    for (const { t, claves } of lineas) {
+      for (const k of claves) {
+        if (abiertas.has(k)) continue
+        abiertas.set(k, t)
+        veces.set(k, (veces.get(k) ?? 0) + 1)
+        senales++
+        if (k.startsWith('alta:')) altas++
+      }
+      for (const [k, desde] of [...abiertas]) {
+        if (claves.includes(k)) continue
+        duraciones.push(Math.round((t - desde) / MIN))
+        abiertas.delete(k)
+      }
+    }
+    vivas += abiertas.size
+    reaparecidas += [...veces.values()].filter(n => n > 1).length
+  }
+  return {
+    cambios,
+    senales,
+    altas,
+    resueltas: duraciones.length,
+    vivas,
+    reaparecidas,
+    // Los minutos que tardó en desaparecer cada señal resuelta; la mediana, sólo con diez o más.
+    duraciones_min: duraciones.slice(0, 20),
+    mediana_min: duraciones.length >= N_MINIMO.p50 ? Math.round(cuantil(duraciones, 0.5)) : null,
+    dias: primera === null ? 0 : Math.round(((ahora - primera) / DIA) * 10) / 10,
+  }
+}
+
 // ── Extracción ──────────────────────────────────────────────────────────────────────────────────────
 
 const CONSULTA = 'query($o:String!,$n:String!,$c:String){repository(owner:$o,name:$n){issues(first:100,after:$c,orderBy:{field:CREATED_AT,direction:ASC}){pageInfo{hasNextPage endCursor} nodes{number createdAt closedAt state stateReason labels(first:30){nodes{name}}}}}}'
@@ -343,7 +402,13 @@ export async function principalDiario(argv, deps = {}) {
     const ahora = deps.ahora ?? Date.now()
     const repositorios = {}
     for (const e of entradas) repositorios[barras(e.raiz).toLowerCase()] = await diarioDe(e, { ...deps, ahora })
-    await escribir(path.join(salida, 'diario.json'), `${JSON.stringify({ version: VERSION, calculado_ms: ahora, calculado: instante(ahora), duracion_ms: Date.now() - inicio, repositorios }, null, 2)}\n`)
+    let decisiones = null
+    try {
+      decisiones = decisionesDe(fs.readFileSync(path.join(salida, 'decisiones.tsv'), 'utf8'), ahora)
+    } catch {
+      decisiones = null
+    }
+    await escribir(path.join(salida, 'diario.json'), `${JSON.stringify({ version: VERSION, calculado_ms: ahora, calculado: instante(ahora), duracion_ms: Date.now() - inicio, decisiones, repositorios }, null, 2)}\n`)
     const medidos = Object.values(repositorios).filter(r => r.medido).length
     console.log(`diario: ${medidos} de ${entradas.length} ${entradas.length === 1 ? 'repositorio medido' : 'repositorios medidos'} · ${Date.now() - inicio} ms · ${salida}/diario.json`)
     return 0

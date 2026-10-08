@@ -39,13 +39,22 @@
     ".env"
   ],
   "produccion": {
-    "salud": "https://ejemplo.invalid/health"
+    "salud": "https://ejemplo.invalid/health",
+    "rutas": [
+      "apps",
+      "packages",
+      "db"
+    ]
   },
   "herramientas": {
     "gh": "scripts/gh-acme.sh",
     "candado": ".suite.lock",
     "migraciones": "db/migrations",
-    "incidentes": ".claude/incidentes.tsv"
+    "incidentes": ".claude/incidentes.tsv",
+    "dias_rama_antigua": 14,
+    "stash_revisados": [
+      "un mensaje de stash ya revisado"
+    ]
   },
   "migraciones": {
     "_regla": "Antes de numerar una migración, reserva aquí su número. El index mide el uso real y avisa si no coincide.",

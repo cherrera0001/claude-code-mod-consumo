@@ -469,7 +469,7 @@ export function frases(s: Salida, parada?: { parar: boolean; numero: number | nu
  * archivos (la primera de la cola que no espere al dueño). Sale del fichero y de nada más. El paso no se inventa: sin `declarado[n].pasos`, o con todos hechos,
  * la orden es parar. Es lo único que llega al modelo cuando el bucle despierta.
  */
-export function orden(estado: Estado): { texto: string; parar: boolean; numero: number | null; paso: string | null } {
+function ordenDeSiempre(estado: Estado): { texto: string; parar: boolean; numero: number | null; paso: string | null } {
   // Las vigentes de esta sesión, en el orden de la cola (las claves numéricas de un objeto salen por número, no
   // por cola). La orden es la de la primera que no espere al dueño; si todas esperan, se para con el motivo.
   const cola = estado.cola ?? []
@@ -524,5 +524,95 @@ export function conDecision(estado: Estado, s: Salida, github: string, abiertas:
     asignaciones: s.asignaciones,
     clasificacion: s.filas,
     router: { github, issues_abiertas: abiertas, ...(pendientes.length ? { pendientes } : {}) },
+  }
+}
+
+// ── El control escucha: la orden sale de las señales ────────────────────────────────────────────────
+
+/** Un cuello de botella del index, tal como lo deja el guion en index.json. `datos` es lo que el control lee. */
+export type Senal = { tipo: string; gravedad: 'alta' | 'media'; que: string; desde?: string; datos?: Record<string, unknown> }
+
+/** Lo que una señal manda hacer, y por qué: la señal que lo causó y su número. */
+export type Causa = { regla: 'credencial' | 'remoto' | 'migracion' | 'produccion' | 'pieza' | 'a-medias'; gravedad: 'alta' | 'media'; clave: string; orden: string; porque: string }
+
+export type Orden = {
+  texto: string
+  parar: boolean
+  numero: number | null
+  paso: string | null
+  /** Las señales que mandan, en su orden de prioridad (como mucho tres). Vacío: la orden de siempre. */
+  causas: Causa[]
+  /** Qué señales mandan, sin horas ni duraciones: cambia sólo cuando cambia la orden, no cuando pasa el tiempo. */
+  firma: string
+}
+
+const PRIORIDAD: readonly Causa['regla'][] = ['credencial', 'remoto', 'migracion', 'produccion', 'pieza', 'a-medias']
+const MAXIMO_DE_CAUSAS = 3
+
+function tiempo(min: unknown): string {
+  if (typeof min !== 'number' || !Number.isFinite(min)) return 'un tiempo sin medir'
+  const m = Math.max(0, Math.round(min))
+  if (m < 60) return `${m} min`
+  if (m < 48 * 60) return `${Math.floor(m / 60)} h ${m % 60} min`
+  return `${Math.floor(m / 1440)} días`
+}
+
+/**
+ * Qué señales cambian la orden, en su orden de prioridad. Regla general: terminar antes que empezar.
+ * Una señal que no afecta a esta sesión (el árbol de otro, una issue ajena) no manda aquí.
+ */
+export function causasDe(estado: Estado, senales: readonly Senal[]): Causa[] {
+  const asignaciones = Object.entries(estado.asignaciones ?? {}).filter(([, a]) => a.estado === 'vigente')
+  const mias = new Set(asignaciones.filter(([, a]) => a.trabajador === 'claude').map(([n]) => Number(n)))
+  const vigentes = new Set(asignaciones.map(([n]) => Number(n)))
+  const causas: Causa[] = []
+  const texto = (x: unknown): string => (typeof x === 'string' ? x : '')
+  for (const s of senales) {
+    const d = s.datos ?? {}
+    if (s.tipo === 'credencial') {
+      causas.push({ regla: 'credencial', gravedad: 'alta', clave: 'github', orden: 'Parar lo que dependa de GitHub. Pedir la credencial al dueño ahora, con la prueba (código HTTP y hora). Seguir sólo con lo que no la necesite.', porque: `GitHub respondió ${typeof d.http === 'number' ? d.http : 401} a la credencial declarada${texto(d.hora) ? `, medido el ${texto(d.hora)}` : ''}` })
+    } else if (s.tipo === 'remoto' && d.sesion === true) {
+      causas.push({ regla: 'remoto', gravedad: 'alta', clave: texto(d.a) || 'remoto', orden: 'Antes de verificar o empujar: traer el remoto y volver a medir.', porque: `el remoto movió la rama principal (${texto(d.de) || 'lo que este clon conoce'} → ${texto(d.a) || 'otro commit'}) y esta sesión tiene trabajo debajo` })
+    } else if (s.tipo === 'migracion' && (d.sesion === true || (Array.isArray(d.issues) && d.issues.some(n => mias.has(Number(n)))))) {
+      causas.push({ regla: 'migracion', gravedad: 'alta', clave: texto(d.numero) || 'numero', orden: 'Reservar o renumerar antes de seguir; no encargar otra migración hasta que cuadre.', porque: `migración ${texto(d.numero)}: ${s.que}` })
+    } else if (s.tipo === 'produccion' && d.codigo === 'distinto') {
+      causas.push({ regla: 'produccion', gravedad: 'alta', clave: texto(d.principal) || 'produccion', orden: 'Desplegar, en orden: migraciones, API, web.', porque: `producción corre ${texto(d.produccion)} y la rama principal está en ${texto(d.principal)}; entre los dos cambió código de lo que se despliega` })
+    } else if (s.tipo === 'pieza' || s.tipo === 'piezas-viejas') {
+      const piezas = (s.tipo === 'pieza' ? [d] : Array.isArray(d.piezas) ? d.piezas : []) as Record<string, unknown>[]
+      for (const p of piezas) {
+        const deEstaSesion = p.principal === true || (typeof p.issue === 'number' && vigentes.has(p.issue))
+        const p95 = typeof p.p95_min === 'number' ? p.p95_min : null
+        const espera = typeof p.espera_min === 'number' ? p.espera_min : null
+        // Sin P95 (pocos empujes en el reflog) no hay con qué decir que espera más de lo habitual: no manda.
+        if (!deEstaSesion || p95 === null || espera === null || espera <= p95) continue
+        causas.push({ regla: 'pieza', gravedad: 'media', clave: texto(p.rama) || 'pieza', orden: `Integrar ${texto(p.rama) || 'la pieza terminada'} antes de construir nada nuevo.`, porque: `pieza terminada hace ${tiempo(espera)}; P95 = ${p95} min, n = ${typeof p.n === 'number' ? p.n : 'sin medir'}` })
+      }
+    } else if ((s.tipo === 'sin-confirmar' || s.tipo === 'stash') && d.externo === true && d.sin_moverse === true) {
+      const quien = texto(d.trabajador) || 'ese trabajador'
+      const que = [typeof d.sin_confirmar === 'number' && d.sin_confirmar > 0 ? `${d.sin_confirmar} ficheros sin confirmar` : '', typeof d.stash === 'number' && d.stash > 0 ? `${d.stash} entradas en el stash` : ''].filter(Boolean).join(' y ')
+      causas.push({ regla: 'a-medias', gravedad: 'media', clave: texto(d.rama) || quien, orden: `Preguntar al dueño por ${quien}; no reasignar.`, porque: `${quien} tiene ${que || 'trabajo a medias'} en ${texto(d.rama) || 'su rama'} y no se mueve hace ${tiempo(d.sin_moverse_min)}` })
+    }
+  }
+  return causas.sort((a, b) => PRIORIDAD.indexOf(a.regla) - PRIORIDAD.indexOf(b.regla)).slice(0, MAXIMO_DE_CAUSAS)
+}
+
+/**
+ * La orden del próximo despertar. Sin señales que manden, es la de siempre: la issue de esta sesión, su primer
+ * paso sin hacer, el criterio y los archivos, o parar. Con señales, la orden es resolverlas primero, en su orden
+ * de prioridad y como mucho tres; cada una lleva debajo la señal que la causó y su número. El router sigue sin
+ * entrada ni salida: las señales (los cuellos de index.json) las pasa quien llama.
+ */
+export function orden(estado: Estado, senales: readonly Senal[] = []): Orden {
+  const base = ordenDeSiempre(estado)
+  const causas = causasDe(estado, senales)
+  if (!causas.length) return { ...base, causas, firma: `siempre:${base.numero ?? 'parar'}:${base.paso ?? ''}` }
+  const despues = base.parar ? 'Después, si no queda nada de lo anterior: parar.' : `Después, y sólo con lo anterior resuelto: la issue #${base.numero}, paso «${base.paso}».`
+  return {
+    texto: ['Orden: terminar antes que empezar.', ...causas.flatMap((c, i) => [`${i + 1}. ${c.orden}`, `   porque: ${c.porque}`]), despues].join('\n'),
+    parar: false,
+    numero: base.numero,
+    paso: base.paso,
+    causas,
+    firma: causas.map(c => `${c.gravedad}:${c.regla}:${c.clave}`).join('|'),
   }
 }
