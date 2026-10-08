@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Avance, Cobertura, Control, GitHub, Resumen, Sesion } from '../types'
-import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, pesar, resto, tabla } from './router'
+import { COLA_INICIAL, EXTERNOS, TRABAJADORES, arbol, clasificar, conDecision, enrutar, frases, orden, pesar, resto, tabla } from './router'
 import type { Actividad, Asignacion, Estado, Issue, Salida, Trabajador } from './router'
 
 // consumo 2.0 mide, gestiona y controla. Mide como antes. Gestiona la cola y quién tiene cada issue. Controla:
@@ -68,6 +68,7 @@ const control = atom({ plugin: 'consumo', key: 'control' } as const, {
   frases: [],
   resto: [],
   avisos: [],
+  orden: '',
 } as Control)
 
 // El resumidor, tal cual está en hooks/resumen_transcripcion.py; se ejecuta por stdin porque el módulo
@@ -760,22 +761,7 @@ async function candadoDeSuite($: any, raiz: string): Promise<string> {
   }
 }
 
-/** Lo que lee quien despierta: la orden, en frases, y lo que no se delega. Sin cifras de consumo. */
-function textoDeControl(c: Control): string {
-  return [
-    'Control de consumo (decisión escrita en .claude/orquestacion.json). Obedécela: no tomes otra issue ni reasignes mientras haya una asignación vigente.',
-    ...c.frases,
-    ...c.resto,
-    ...c.avisos,
-    c.github === 'ok' || !c.github ? '' : `GitHub: ${c.github}. La clasificación sale de la cola escrita y de git; títulos, etiquetas y qué sigue abierto no están medidos.`,
-    c.candado ? `El candado .vt-suite.lock está tomado (${c.candado}): no lances pnpm verify, pnpm gate ni pnpm e2e.` : '',
-    'Empujar main, migrar producción y desplegar el API los hace esta sesión, nunca Agy ni Codex, y sólo con la orden del dueño. Integrar una rama: sólo con scripts/integrar-rama.sh.',
-  ]
-    .filter(Boolean)
-    .join('\n')
-}
-
-type Decision = { salida: Salida; github: string; texto: string; estado: Estado; raiz: string; repoGh: string }
+type Decision = { salida: Salida; github: string; orden: string; estado: Estado; raiz: string; repoGh: string }
 
 /**
  * El control: mide, decide (router.ts) y escribe. Sólo actúa en un repositorio que tenga .claude/orquestacion.json.
@@ -815,7 +801,6 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
     issues,
     estado: leido,
     actividad: await leerActividad($, raiz, ahoraMs),
-    modeloSesion: corto(String(await $.session.model().catch(() => ''))),
     ahora: new Date(ahoraMs).toISOString(),
     abiertas: medidas ? new Set(medidas.map(i => i.numero)) : null,
   })
@@ -823,22 +808,21 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
   const despues = `${JSON.stringify(estado, null, 2)}\n`
   // Sólo se escribe si la decisión cambió: el fichero está versionado y un árbol sucio no se despliega.
   if (despues !== antes) await $.fs.write(`${raiz}/.claude/orquestacion.json`, despues)
-  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida), resto: resto(salida), avisos: salida.avisos }
+  const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida, orden(estado)), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
   await update($, control, () => nuevo)
-  return { salida, github, texto: textoDeControl(nuevo), estado, raiz, repoGh }
+  return { salida, github, orden: nuevo.orden, estado, raiz, repoGh }
 }
 
-function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, modelo: string, ahora: string, motivo: string): Asignacion {
+function asignacionAMano(i: Issue, estado: Estado, quien: Trabajador, raiz: string, ahora: string, motivo: string): Asignacion {
   const d = estado.declarado?.[String(i.numero)]
   const { puntos } = pesar(i, d)
-  const t = tabla(puntos, modelo)
+  const t = tabla(puntos)
   return {
     trabajador: quien,
     clase: clasificar(i, d),
     puntos,
     peso: t.peso,
     esfuerzo: t.esfuerzo,
-    modelo: t.modelo,
     estado: 'vigente',
     desde: ahora,
     motivo,
@@ -851,7 +835,6 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
   const [orden = '', a = '', ...mas] = argumentos.split(/\s+/)
   const raiz = barras(String(await $.session.root()))
   const ahora = new Date(await $.clock.now()).toISOString()
-  const modelo = corto(String(await $.session.model().catch(() => '')))
   let linea = ''
   let nota: { numero: number; texto: string } | null = null
   let cambio: ((estado: Estado, issues: Issue[]) => string | null) | undefined
@@ -875,14 +858,14 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
       const d = estado.declarado?.[String(numero)]
       const clase = clasificar(i, d)
       if (clase === 'Decisión') return `La #${numero} es una Decisión: espera al dueño y no se asigna a nadie.`
-      if (clase === 'Épica') return `La #${numero} es una épica: no lleva modelo ni trabajador.`
+      if (clase === 'Épica') return `La #${numero} es una épica: no lleva trabajador.`
       const motivoFuera = estado.fuera?.[quien]
       if (motivoFuera) return `${quien} está fuera (${motivoFuera}): no recibe la #${numero}.`
       if (quien !== 'claude' && (d?.solo_sesion || pesar(i, d).criterios.produccion)) return `La #${numero} toca producción o está reservada a esta sesión: no se delega a ${quien}.`
       const otra = Object.entries(estado.asignaciones ?? {}).find(([n, x]) => Number(n) !== numero && (x.trabajador === quien || x.contra === quien))
       if (otra) return `${quien} ya tiene la #${otra[0]}. Un trabajador, una issue: libérala antes.`
       const antes = estado.asignaciones?.[String(numero)]?.trabajador
-      const nueva = asignacionAMano(i, estado, quien, raiz, modelo, ahora, `reasignada a mano${antes ? ` desde ${antes}` : ''}`)
+      const nueva = asignacionAMano(i, estado, quien, raiz, ahora, `reasignada a mano${antes ? ` desde ${antes}` : ''}`)
       estado.asignaciones = { ...(estado.asignaciones ?? {}), [String(numero)]: nueva }
       estado.reasignado = { ...(estado.reasignado ?? {}), [String(numero)]: `${quien} (a mano, ${ahora.slice(0, 10)})` }
       linea = `La #${numero} pasa a ${quien}.`
@@ -907,7 +890,7 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
       await $.fs.write(`${r.raiz}/.claude/orquestacion.json`, `${JSON.stringify(conPendiente, null, 2)}\n`)
     }
   }
-  return [linea, ...frases(r.salida), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
+  return [linea, ...frases(r.salida, orden(r.estado)), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
 }
 
 async function refrescar($: any): Promise<void> {
@@ -1191,21 +1174,24 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Cada despertar del bucle vuelve a decidir, y recibe la decisión junto a su prompt.
+  // Cada despertar del bucle vuelve a decidir, y al modelo le llega SÓLO la orden: la issue, el siguiente paso
+  // sin hacer, el criterio y los archivos; o parar. El prompt del bucle no entra: releerlo entero en cada
+  // despertar era pagar dos veces. Cuando el bucle se reprograma con esta misma orden, el siguiente despertar
+  // la vuelve a armar desde el fichero, así que un paso marcado hecho cambia la orden sin que nadie la reescriba.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin?.kind !== 'scheduled-trigger') return next(e)
-    const r = await controlar($, repo).catch(() => null)
+    const r = await controlar($, repo)
     if (!r || 'error' in r) return next(e)
-    return next({ ...e, context: [...(e.context ?? []), r.texto] })
-    // Si el control falla, el prompt entra igual: un despertar nunca se pierde por él.
+    return next({ ...e, text: r.orden })
+    // Si el control falla, entra el prompt original: un despertar nunca se pierde por él.
   }).catch(($, e, next) => next(e))
 
-  // La decisión vigente va en el prompt de sistema: es donde la lee quien empieza a trabajar.
+  // La misma orden, en pocas líneas y con alcance de sesión: es donde la lee quien empieza a trabajar.
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     const c = await read($, control)
-    if (!c.activo || c.frases.length === 0) return r
-    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: textoDeControl(c), scope: 'session' as const }] }
+    if (!c.activo || !c.orden) return r
+    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: `Control de consumo (.claude/orquestacion.json).\n${c.orden}`, scope: 'session' as const }] }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -1381,6 +1367,11 @@ export const register: Register = (on, options) => {
           {ctl.frases.map(f => (
             <Text wrap="wrap">{f}</Text>
           ))}
+          {ctl.orden ? (
+            <Text bold wrap="wrap">
+              {ctl.orden}
+            </Text>
+          ) : null}
           {ctl.resto.map(f => (
             <Text dimColor wrap="wrap">
               {f}

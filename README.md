@@ -18,8 +18,8 @@ Sólo se gasta. Esta semana: ≈ 11 USD de consumo y ninguna issue cerrada (21 c
 Issues: 132 cerradas · 5 descartadas · 209 creadas · 72 abiertas hoy
 
 3 · ¿Quién tiene cada issue y qué va a hacer el próximo despertar? · decidido 15:04
-Esta sesión tiene la #333 (Cierre), peso L, esfuerzo muy alto, modelo opus. El próximo despertar sigue con ella y no toma otra.
-Agy tiene la #346 (Construcción), peso M, esfuerzo alto, modelo opus. El próximo despertar la deja donde está si la rama agy/346 se movió en los últimos 30 minutos; si no, la marca por retomar.
+Esta sesión tiene la #333 (Cierre), peso L, esfuerzo muy alto. El próximo despertar sigue con ella y no toma otra.
+Agy tiene la #346 (Construcción), peso M, esfuerzo alto. El próximo despertar la deja donde está si la rama agy/346 se movió en los últimos 30 minutos; si no, la marca por retomar.
 En cola: #342, #343. Espera al dueño: #325.
 ```
 
@@ -79,13 +79,22 @@ En `session.start` y en cada despertar del bucle (`/loop`), antes de que nadie e
    producción o una puerta.
 4. **Asigna, reasigna o se detiene**, y lo escribe en `.claude/orquestacion.json`:
 
-| Puntos | Peso | Esfuerzo | Modelo | Quién lo hace |
-|---|---|---|---|---|
-| 0 | XS | bajo | haiku | esta sesión |
-| 1 | S | medio | sonnet | esta sesión |
-| 2 | M | alto | el de la sesión | esta sesión, o Agy si esta sesión está desplegando |
-| 3 | L | muy alto | el de la sesión | Claude construye; Agy o Codex, el que esté libre, revisa en sólo lectura |
-| 4–5 | XL | máximo, con plan antes | el de la sesión | no se asigna entera: se parte en pesos L o M |
+| Puntos | Peso | Esfuerzo | Quién lo hace |
+|---|---|---|---|
+| 0 | XS | bajo | esta sesión |
+| 1 | S | medio | esta sesión |
+| 2 | M | alto | esta sesión, o Agy si esta sesión está desplegando |
+| 3 | L | muy alto | Claude construye; Agy o Codex, el que esté libre, revisa en sólo lectura |
+| 4–5 | XL | máximo, con plan antes | no se asigna entera: se parte en pesos L o M |
+
+El control **no asigna modelo**: el modelo es el de la sesión y se lee. El dial es el esfuerzo.
+
+5. **Le da al despertar sólo la orden.** Cuando el bucle despierta (`scheduled-trigger`), al modelo no le llega
+   el prompt del bucle: le llega la issue que tiene esta sesión, **su primer paso sin hacer**, el criterio y los
+   archivos. El paso no se inventa: sale de `declarado[n].pasos` del fichero, y alguien lo marca `hecho`; el
+   hook no lo da por hecho. Sin pasos, con todos hechos, o con `espera` escrito, la orden es **parar**: no se
+   recorre el tablero ni se abren issues. Si el control falla, entra el prompt original: un despertar no se
+   pierde. La misma orden, en pocas líneas, va en el prompt de sistema.
 
 Reglas que el control no negocia:
 
@@ -112,7 +121,7 @@ Para desarrollarlo desde una copia local: `claude --plugin-dir <carpeta de este 
 |---|---|
 | `/consumo` | Pinta el panel y devuelve el resumen de la sesión |
 | `/consumo avance` | Vuelve a medir issues cerradas y parte de la factura (tarda medio minuto) |
-| `/consumo agentes` | Ejecuta el control y responde con una frase por issue: quién, número, peso, modelo y qué hará el próximo despertar |
+| `/consumo agentes` | Ejecuta el control y responde con una frase por issue: quién, número, peso y qué hará el próximo despertar |
 | `/consumo fuera <agy\|codex> <motivo>` | Saca a ese trabajador y mueve su issue |
 | `/consumo tomar <número> <agy\|codex\|claude>` | Reasigna a mano y lo anota en la issue con una línea |
 | `/consumo github` | Relee issues y PR abiertos |
@@ -138,9 +147,9 @@ se le dice lo que `git` y GitHub no saben. Plantilla: [`ejemplos/orquestacion.js
 |---|---|---|
 | `cola` | tú | El orden en que se toman las issues |
 | `fuera` | tú o `/consumo fuera` | Trabajador → motivo |
-| `declarado` | tú | Por issue: `clase`, `falta`, `solo_sesion` y las cinco respuestas del peso |
+| `declarado` | tú | Por issue: `clase`, `falta`, `solo_sesion`, las cinco respuestas del peso, y lo que arma la orden: `pasos` (lista ordenada, cada uno con `hecho`), `criterio`, `archivos` y `espera` |
 | `no_tocar` | tú | Archivos que un trabajador externo no puede tocar |
-| `asignaciones` | el control | Issue → trabajador, clase, peso, esfuerzo, modelo, estado y encargo |
+| `asignaciones` | el control | Issue → trabajador, clase, peso, esfuerzo, estado y encargo |
 | `clasificacion` | el control | Todas las issues leídas, con su situación |
 | `router` | el control | Si GitHub respondió y qué anotaciones quedaron pendientes |
 

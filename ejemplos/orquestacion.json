@@ -17,7 +17,21 @@
       "sensible": true,
       "diagnostico": false,
       "navegador": true,
-      "produccion": true
+      "produccion": true,
+      "pasos": [
+        {
+          "paso": "validar en el navegador como empresa y como universidad",
+          "hecho": true
+        },
+        {
+          "paso": "desplegar y comprobar el commit publicado",
+          "hecho": false
+        }
+      ],
+      "criterio": "el commit que anuncia el servicio es el que se empujó",
+      "archivos": [
+        "scripts/desplegar.sh"
+      ]
     }
   },
   "no_tocar": [

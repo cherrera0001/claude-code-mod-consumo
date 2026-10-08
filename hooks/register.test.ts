@@ -93,16 +93,26 @@ test('con una medición, el avance real muestra cierres, factura y la semana sin
 // la prueba: el disco (.claude/orquestacion.json), git y el envoltorio de GitHub del repositorio.
 type IssueDePrueba = { number: number; title: string; labels: { name: string }[]; body: string; projectItems: unknown[] }
 
-function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Record<string, unknown>): { escrito: () => any } {
+function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Record<string, unknown>): { escrito: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void } {
   const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string }) => unknown) => void
   let guardado = JSON.stringify(estado)
+  let entrado = ''
+  let roto = false
+  const yo = on as unknown as (evento: string, hook: ($: unknown, e: { text: string }) => unknown) => void
+  yo('prompt.submit', (_$, e) => {
+    entrado = e.text
+    return { text: e.text }
+  })
   contestar('ui.open', () => ({ value: undefined }))
   contestar('clock.now', () => ({ value: 1_780_000_000_000 }))
   contestar('session.id', () => ({ value: 'sesion' }))
   contestar('session.cwd', () => ({ value: 'F:/proyecto' }))
   contestar('session.root', () => ({ value: 'F:/proyecto' }))
   contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
-  contestar('fs.exists', (_$, e) => ({ value: /orquestacion\.json$/.test(String(e.path)) }))
+  contestar('fs.exists', (_$, e) => {
+    if (roto) throw new Error('disco caído')
+    return { value: /orquestacion\.json$/.test(String(e.path)) }
+  })
   contestar('fs.read', () => ({ value: guardado }))
   contestar('fs.write', (_$, e) => {
     guardado = String(e.text)
@@ -115,7 +125,16 @@ function repositorioDePrueba(on: unknown, issues: IssueDePrueba[], estado: Recor
     if (argv[0] === 'git' && argv.includes('log') && argv.includes('main')) return { value: { exitCode: 0, stdout: '', stderr: '' } }
     return { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } }
   })
-  return { escrito: () => JSON.parse(guardado) }
+  return {
+    escrito: () => JSON.parse(guardado),
+    poner: e => {
+      guardado = JSON.stringify(e)
+    },
+    entro: () => entrado,
+    romper: () => {
+      roto = true
+    },
+  }
 }
 
 const issue = (number: number, title: string, etiquetas: string[] = [], body = ''): IssueDePrueba => ({ number, title, labels: etiquetas.map(name => ({ name })), body, projectItems: [{}] })
@@ -129,15 +148,78 @@ test('una Decisión no sale asignada: queda «espera al dueño» y el control si
   expect(repo.escrito().asignaciones['346'].trabajador).toBe('claude')
 })
 
-test('un peso 0 no despierta a Codex: lo hace esta sesión, con haiku y sin revisor', async ($, on) => {
+test('un peso 0 no despierta a Codex: lo hace esta sesión, sin revisor y sin nombrar un modelo', async ($, on) => {
   const repo = repositorioDePrueba(on, [issue(900, 'Un literal de color pasa a token')], { cola: [900] })
   const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
   const a = repo.escrito().asignaciones['900']
   expect(a.trabajador).toBe('claude')
   expect(a.peso).toBe('XS')
-  expect(a.modelo).toBe('haiku')
   expect(a.contra).toBeUndefined()
+  expect(a.modelo).toBeUndefined()
   expect(respuesta).not.toContain('Codex')
+  expect(/haiku|sonnet|opus|modelo/i.test(respuesta)).toBe(false)
+})
+
+// ── El despertar ────────────────────────────────────────────────────────────────────────────────────
+const BUCLE = '/loop Orquesta el cierre de todas las issues abiertas del repositorio, una por una, con su evidencia'
+const despertar = ($: any, text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'scheduled-trigger' } } as never)
+const conPasos = (pasos: { paso: string; hecho: boolean }[]) => ({
+  cola: [346],
+  declarado: { '346': { capas: false, pasos, criterio: 'la pantalla ya no ofrece el botón', archivos: ['apps/web/src/pagina.tsx'] } },
+})
+
+test('un despertar programado con asignación vigente lleva sólo la orden, no el prompt del bucle', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], conPasos([{ paso: 'retirar el botón', hecho: false }, { paso: 'medir en el navegador', hecho: false }]))
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('Orden: issue #346.')
+  expect(repo.entro()).toContain('Siguiente paso: retirar el botón')
+  expect(repo.entro()).toContain('Criterio: la pantalla ya no ofrece el botón')
+  expect(repo.entro()).toContain('apps/web/src/pagina.tsx')
+  expect(repo.entro()).not.toContain('Orquesta el cierre de todas las issues')
+  expect(repo.entro()).not.toContain('medir en el navegador')
+})
+
+test('sin un paso que cierre algo, el despertar dice parar y no recorre el tablero', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], { cola: [346] })
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('parar')
+  expect(repo.entro()).not.toContain('Orquesta el cierre de todas las issues')
+  expect(repo.entro()).not.toContain('Ajustar un formulario')
+})
+
+test('al reprogramarse el bucle, el hook vuelve a armar la orden desde el fichero', async ($, on) => {
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], conPasos([{ paso: 'retirar el botón', hecho: false }, { paso: 'medir en el navegador', hecho: false }]))
+  await despertar($, BUCLE)
+  const primera = repo.entro()
+  // Alguien marca el paso; el bucle se reprograma con la orden que recibió, no con el prompt original.
+  const fichero = repo.escrito()
+  fichero.declarado['346'].pasos[0].hecho = true
+  repo.poner(fichero)
+  await despertar($, primera)
+  expect(repo.entro()).toContain('Siguiente paso: medir en el navegador')
+  expect(repo.entro()).not.toContain('Siguiente paso: retirar el botón')
+  // Con todos los pasos hechos, la orden es parar.
+  fichero.declarado['346'].pasos[1].hecho = true
+  repo.poner(fichero)
+  await despertar($, repo.entro())
+  expect(repo.entro()).toContain('parar')
+})
+
+test('una issue que espera al dueño también es parar, con su motivo, aunque le queden pasos', async ($, on) => {
+  const estado = conPasos([{ paso: 'publicar el cierre', hecho: false }])
+  ;(estado.declarado['346'] as Record<string, unknown>).espera = 'falta una credencial vigente'
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], estado)
+  await despertar($, BUCLE)
+  expect(repo.entro()).toContain('parar')
+  expect(repo.entro()).toContain('falta una credencial vigente')
+  expect(repo.entro()).not.toContain('publicar el cierre')
+})
+
+test('si el control falla, entra el prompt original: el despertar no se pierde', async ($, on) => {
+  const repo = repositorioDePrueba(on, [], { cola: [346] })
+  repo.romper()
+  await despertar($, BUCLE)
+  expect(repo.entro()).toBe(BUCLE)
 })
 
 test('«/consumo agentes» responde en frases y no contiene la palabra «llamadas»', async ($, on) => {

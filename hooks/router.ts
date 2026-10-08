@@ -18,6 +18,8 @@ export type Criterios = {
 }
 export const PREGUNTAS: readonly (keyof Criterios)[] = ['capas', 'sensible', 'diagnostico', 'navegador', 'produccion']
 
+export type Paso = { paso: string; hecho: boolean }
+
 /** Lo que la sesión o el dueño dejan escrito de una issue y que ni git ni GitHub saben. */
 export type Declarado = Partial<Criterios> & {
   clase?: Clase
@@ -25,6 +27,14 @@ export type Declarado = Partial<Criterios> & {
   falta?: string
   /** Sólo la construye esta sesión (orden de despliegue dada, trabajo sin empujar a propósito). */
   solo_sesion?: boolean
+  /** Los pasos que la cierran, en orden. Alguien marca `hecho`; el control no lo da por hecho. */
+  pasos?: Paso[]
+  /** El criterio con que se da por bueno el paso en curso. */
+  criterio?: string
+  /** Los archivos que el trabajo toca. */
+  archivos?: string[]
+  /** Lo que sólo el dueño puede destrabar (una credencial, una decisión). Mientras esté escrito, el despertar para. */
+  espera?: string
 }
 
 export type Issue = {
@@ -46,7 +56,6 @@ export type Asignacion = {
   puntos: number
   peso: Peso
   esfuerzo: string
-  modelo: string
   /** Quien hace el CONTRA en sólo lectura (peso L), o por qué no hay nadie. */
   contra?: Trabajador
   sin_contra?: string
@@ -65,7 +74,6 @@ export type Fila = {
   puntos: number | null
   peso: Peso | null
   esfuerzo: string | null
-  modelo: string | null
   trabajador: Trabajador | null
   /** asignada · en cola · espera al dueño · épica · interina · partir · contra */
   situacion: 'asignada' | 'en cola' | 'espera al dueño' | 'épica' | 'interina' | 'partir'
@@ -114,19 +122,18 @@ export function arbol(raiz: string, quien: Trabajador): string {
   return quien === 'claude' ? raiz : `${raiz}-${quien}`
 }
 
-const TABLA: readonly { peso: Peso; esfuerzo: string; modelo: string }[] = [
-  { peso: 'XS', esfuerzo: 'bajo', modelo: 'haiku' },
-  { peso: 'S', esfuerzo: 'medio', modelo: 'sonnet' },
-  { peso: 'M', esfuerzo: 'alto', modelo: 'sesión' },
-  { peso: 'L', esfuerzo: 'muy alto', modelo: 'sesión' },
-  { peso: 'XL', esfuerzo: 'máximo, con plan antes', modelo: 'sesión' },
-  { peso: 'XL', esfuerzo: 'máximo, con plan antes', modelo: 'sesión' },
+const TABLA: readonly { peso: Peso; esfuerzo: string }[] = [
+  { peso: 'XS', esfuerzo: 'bajo' },
+  { peso: 'S', esfuerzo: 'medio' },
+  { peso: 'M', esfuerzo: 'alto' },
+  { peso: 'L', esfuerzo: 'muy alto' },
+  { peso: 'XL', esfuerzo: 'máximo, con plan antes' },
+  { peso: 'XL', esfuerzo: 'máximo, con plan antes' },
 ]
 
-/** Puntos → peso, esfuerzo y modelo. `modeloSesion` es el nombre del modelo de esta sesión. */
-export function tabla(puntos: number, modeloSesion: string): { peso: Peso; esfuerzo: string; modelo: string } {
-  const fila = TABLA[Math.max(0, Math.min(5, puntos))]!
-  return { ...fila, modelo: fila.modelo === 'sesión' ? modeloSesion || 'el de la sesión' : fila.modelo }
+/** Puntos → peso y esfuerzo. El modelo no se asigna: es el de la sesión, y se lee. */
+export function tabla(puntos: number): { peso: Peso; esfuerzo: string } {
+  return TABLA[Math.max(0, Math.min(5, puntos))]!
 }
 
 const sinAcentos = (t: string): string => t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
@@ -209,7 +216,6 @@ export type Entrada = {
   issues: Issue[]
   estado: Estado
   actividad: Actividad
-  modeloSesion: string
   /** ISO de ahora; va a `desde` de las asignaciones nuevas. */
   ahora: string
   /** Números que GitHub dice abiertos; null si no se pudo medir (entonces no se da nada por cerrado). */
@@ -285,7 +291,7 @@ export function enrutar(e: Entrada): Salida {
     const d = declarado[String(numero)]
     const clase = clasificar(i, d)
     const base = { numero, titulo: i.titulo, clase }
-    const vacia = { puntos: null, peso: null, esfuerzo: null, modelo: null, trabajador: null, origen: null, criterios: null }
+    const vacia = { puntos: null, peso: null, esfuerzo: null, trabajador: null, origen: null, criterios: null }
     if (clase === 'Decisión') {
       filas.push({ ...base, ...vacia, situacion: 'espera al dueño', nota: 'espera al dueño' })
       continue
@@ -307,14 +313,14 @@ export function enrutar(e: Entrada): Salida {
       continue
     }
     const { criterios, origen, puntos } = pesar(i, d)
-    const t = tabla(puntos, e.modeloSesion)
-    const medido = { puntos, peso: t.peso, esfuerzo: t.esfuerzo, modelo: t.modelo, origen, criterios }
+    const t = tabla(puntos)
+    const medido = { puntos, peso: t.peso, esfuerzo: t.esfuerzo, origen, criterios }
     const falta = d?.falta ? ` Falta: ${d.falta}` : ''
 
     const ya = asignaciones[String(numero)]
     if (ya) {
       // Vigente: no se reasigna. El peso se vuelve a medir y se anota, porque lo que falta cambia.
-      asignaciones[String(numero)] = { ...ya, clase, puntos, peso: t.peso, esfuerzo: t.esfuerzo, modelo: t.modelo }
+      asignaciones[String(numero)] = { ...ya, clase, puntos, peso: t.peso, esfuerzo: t.esfuerzo }
       filas.push({ ...base, ...medido, trabajador: ya.trabajador, situacion: 'asignada', nota: `${ya.estado}: ${ya.motivo}.${falta}` })
       continue
     }
@@ -346,7 +352,7 @@ export function enrutar(e: Entrada): Salida {
       continue
     }
 
-    const nueva: Asignacion = { trabajador: quien, clase, puntos, peso: t.peso, esfuerzo: t.esfuerzo, modelo: t.modelo, estado: 'vigente', desde: e.ahora, motivo }
+    const nueva: Asignacion = { trabajador: quien, clase, puntos, peso: t.peso, esfuerzo: t.esfuerzo, estado: 'vigente', desde: e.ahora, motivo }
     ocupado.set(quien, numero)
     if (quien !== 'claude') {
       nueva.arbol = arbol(e.raiz, quien)
@@ -380,16 +386,48 @@ export function proximo(a: Asignacion): string {
   return `El próximo despertar la deja donde está si la rama ${a.rama ?? `${a.trabajador}/…`} se movió en los últimos ${INACTIVO_MIN} minutos; si no, la marca por retomar`
 }
 
-/** Una frase por issue asignada: quién, qué número, qué peso, qué modelo y qué hará el próximo despertar. */
-export function frases(s: Salida): string[] {
+/** Una frase por issue asignada: quién, qué número, qué peso y qué hará el próximo despertar. */
+export function frases(s: Salida, parada?: { parar: boolean; numero: number | null }): string[] {
   const salida: string[] = []
   for (const [clave, a] of Object.entries(s.asignaciones)) {
     const contra = a.contra ? `; ${NOMBRE[a.contra]} la revisa en sólo lectura` : a.sin_contra ? `; nadie libre para revisarla (${a.sin_contra})` : ''
     const retomar = a.estado === 'por retomar' ? ` Por retomar: ${a.motivo}.` : ''
-    salida.push(`${NOMBRE[a.trabajador]} tiene la #${clave} (${a.clase}), peso ${a.peso}, esfuerzo ${a.esfuerzo}, modelo ${a.modelo}${contra}.${retomar} ${proximo(a)}.`)
+    salida.push(`${NOMBRE[a.trabajador]} tiene la #${clave} (${a.clase}), peso ${a.peso}, esfuerzo ${a.esfuerzo}${contra}.${retomar} ${parada?.parar && parada.numero === Number(clave) ? 'El próximo despertar para: no le queda un paso que se pueda dar' : proximo(a)}.`)
   }
   if (salida.length === 0) salida.push('Nadie tiene una issue: no queda nada que se pueda asignar sin el dueño. El próximo despertar se detiene.')
   return salida
+}
+
+/**
+ * La orden del próximo despertar de esta sesión: la issue que tiene, su primer paso sin hacer, el criterio y los
+ * archivos. Sale del fichero y de nada más. El paso no se inventa: sin `declarado[n].pasos`, o con todos hechos,
+ * la orden es parar. Es lo único que llega al modelo cuando el bucle despierta.
+ */
+export function orden(estado: Estado): { texto: string; parar: boolean; numero: number | null; paso: string | null } {
+  const mia = Object.entries(estado.asignaciones ?? {}).find(([, a]) => a.trabajador === 'claude' && a.estado === 'vigente')
+  const cierre = 'No recorras el tablero ni abras issues: termina el bucle (ScheduleWakeup con stop) y dilo en una línea.'
+  if (!mia) return { texto: `Orden: parar. Esta sesión no tiene una asignación vigente. ${cierre}`, parar: true, numero: null, paso: null }
+  const numero = Number(mia[0])
+  const d = estado.declarado?.[mia[0]]
+  if (d?.espera) return { texto: `Orden: parar. La #${numero} espera al dueño: ${d.espera}. ${cierre}`, parar: true, numero, paso: null }
+  const siguiente = (d?.pasos ?? []).find(x => !x.hecho)
+  if (!siguiente) {
+    const porque = d?.pasos?.length ? 'todos sus pasos están hechos' : 'no tiene pasos declarados (declarado.' + numero + '.pasos)'
+    return { texto: `Orden: parar. La #${numero} es de esta sesión, pero ${porque} en .claude/orquestacion.json: no queda un paso que cierre algo. ${cierre}`, parar: true, numero, paso: null }
+  }
+  const noTocar = estado.no_tocar?.length ? estado.no_tocar : NO_TOCAR_INICIAL
+  return {
+    texto: [
+      `Orden: issue #${numero}.`,
+      `Siguiente paso: ${siguiente.paso}`,
+      `Criterio: ${d?.criterio ?? `el que la issue #${numero} deja escrito`}`,
+      `Archivos: ${d?.archivos?.length ? d.archivos.join(', ') : 'sólo los que este paso exija'}. No toques: ${noTocar.join('; ')}.`,
+      'Haz sólo este paso. Al terminarlo, márcalo hecho en .claude/orquestacion.json; no lo des por hecho sin medirlo. Empujar, migrar y desplegar: sólo con la orden del dueño.',
+    ].join('\n'),
+    parar: false,
+    numero,
+    paso: siguiente.paso,
+  }
 }
 
 /** Lo que no salió asignado, en una línea por situación. */

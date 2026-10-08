@@ -175,6 +175,8 @@ export type Control = {
   frases: string[]
   resto: string[]
   avisos: string[]
+  /** La orden del próximo despertar de esta sesión: issue, paso sin hacer, criterio y archivos; o parar. */
+  orden: string
 }
 
 declare module 'claude-code' {
