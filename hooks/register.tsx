@@ -693,13 +693,42 @@ function ghDelProyecto(raiz: string, ...orden: string[]): string[] {
   return ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `${raiz}/scripts/gh-vt.ps1`, ...orden]
 }
 
-async function leerEstado($: any, raiz: string): Promise<{ estado: Estado; texto: string }> {
+// Dos ficheros. El VERSIONADO lo escribe una persona (cola, fuera, declarado, no_tocar, produccion) y el control
+// no lo toca: un árbol sucio no se despliega. El LOCAL lo escribe el control y no se versiona.
+const VERSIONADO = '.claude/orquestacion.json'
+const LOCAL = '.claude/orquestacion.local.json'
+const DEL_CONTROL = ['asignaciones', 'clasificacion', 'router', 'reasignado'] as const
+
+function loDelControl(estado: Estado): Estado {
+  const solo: Estado = {}
+  for (const clave of DEL_CONTROL) if (estado[clave] !== undefined) (solo as Record<string, unknown>)[clave] = estado[clave]
+  return solo
+}
+
+/**
+ * El estado que el control decide: lo declarado en el fichero versionado más lo suyo, del local. Si el local
+ * todavía no existe, vale lo que el versionado traiga de antes de la 2.1.1; desde ahí sólo se escribe el local.
+ */
+async function leerEstado($: any, raiz: string): Promise<{ estado: Estado; declarado: Estado; textoLocal: string }> {
+  let declarado: Estado = {}
   try {
-    const leido = String(await $.fs.read(`${raiz}/.claude/orquestacion.json`))
-    return { estado: JSON.parse(leido) as Estado, texto: leido }
+    const leido = JSON.parse(String(await $.fs.read(`${raiz}/${VERSIONADO}`))) as unknown
+    if (leido && typeof leido === 'object' && !Array.isArray(leido)) declarado = leido as Estado
   } catch {
-    return { estado: {}, texto: '' }
+    declarado = {}
   }
+  let textoLocal = ''
+  let local: Estado = {}
+  try {
+    if (await $.fs.exists(`${raiz}/${LOCAL}`)) {
+      textoLocal = String(await $.fs.read(`${raiz}/${LOCAL}`))
+      const leido = JSON.parse(textoLocal) as unknown
+      if (leido && typeof leido === 'object' && !Array.isArray(leido)) local = loDelControl(leido as Estado)
+    }
+  } catch {
+    local = {}
+  }
+  return { estado: { ...declarado, ...local }, declarado, textoLocal }
 }
 
 /**
@@ -820,7 +849,8 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
     await update($, control, c => ({ ...c, activo: false }))
     return null
   }
-  const { estado: leido, texto: antes } = await leerEstado($, raiz)
+  const { estado: leido, declarado, textoLocal: antes } = await leerEstado($, raiz)
+  const fueraAntes = JSON.stringify(leido.fuera ?? {})
   const repoGh = await repoDe($, repoCfg)
   const { issues: medidas, github } = await leerIssues($, raiz, repoGh)
   // Sin GitHub no se da nada por cerrado ni se inventan títulos: se enruta la cola escrita, marcada como no medida.
@@ -852,9 +882,11 @@ async function controlar($: any, repoCfg: string, cambio?: (estado: Estado, issu
     abiertas: medidas ? new Set(medidas.map(i => i.numero)) : null,
   })
   const estado = conDecision(leido, salida, github, medidas ? medidas.length : null, leido.router?.pendientes ?? [])
-  const despues = `${JSON.stringify(estado, null, 2)}\n`
-  // Sólo se escribe si la decisión cambió: el fichero está versionado y un árbol sucio no se despliega.
-  if (despues !== antes) await $.fs.write(`${raiz}/.claude/orquestacion.json`, despues)
+  const despues = `${JSON.stringify(loDelControl(estado), null, 2)}\n`
+  // La decisión va al fichero local, y sólo si cambió. El versionado no se toca.
+  if (despues !== antes) await $.fs.write(`${raiz}/${LOCAL}`, despues)
+  // La única escritura en el versionado es una orden de la persona: «/consumo fuera» declara quién no recibe nada.
+  if (JSON.stringify(estado.fuera ?? {}) !== fueraAntes) await $.fs.write(`${raiz}/${VERSIONADO}`, `${JSON.stringify({ ...declarado, fuera: estado.fuera }, null, 2)}\n`)
   const nuevo: Control = { cuando: ahoraMs, activo: true, github, candado: await candadoDeSuite($, raiz), frases: frases(salida, orden(estado), estado.declarado), resto: resto(salida), avisos: salida.avisos, orden: orden(estado).texto }
   await update($, control, () => nuevo)
   return { salida, github, orden: nuevo.orden, estado, raiz, repoGh }
@@ -890,10 +922,7 @@ async function generarIndex($: any, reparto: Avance['reparto'], carpeta: string)
     let estado: Estado | null = null
     let despertar = null
     try {
-      if (raiz && (await $.fs.exists(`${raiz}/.claude/orquestacion.json`))) {
-        const leido = JSON.parse(String(await $.fs.read(`${raiz}/.claude/orquestacion.json`))) as unknown
-        if (leido && typeof leido === 'object' && !Array.isArray(leido)) estado = leido as Estado
-      }
+      if (raiz && (await $.fs.exists(`${raiz}/${VERSIONADO}`))) estado = (await leerEstado($, raiz)).estado
     } catch {
       estado = null
     }
@@ -1002,9 +1031,9 @@ async function ordenDeControl($: any, repoCfg: string, argumentos: string): Prom
     const c = await correr($, ghDelProyecto(r.raiz, 'issue', 'comment', String(pendiente.numero), '--repo', r.repoGh, '--body', pendiente.texto), r.raiz, 45_000)
     if (c.ok) anotado.push(`Anotado en la #${pendiente.numero}.`)
     else {
-      anotado.push(`No se pudo anotar en la #${pendiente.numero} (${primeraLinea(c.stderr) || 'gh-vt.ps1 falló'}): queda pendiente en .claude/orquestacion.json.`)
+      anotado.push(`No se pudo anotar en la #${pendiente.numero} (${primeraLinea(c.stderr) || 'gh-vt.ps1 falló'}): queda pendiente en .claude/orquestacion.local.json.`)
       const conPendiente = { ...r.estado, router: { ...r.estado.router!, pendientes: [...(r.estado.router?.pendientes ?? []), `#${pendiente.numero}: ${pendiente.texto}`] } }
-      await $.fs.write(`${r.raiz}/.claude/orquestacion.json`, `${JSON.stringify(conPendiente, null, 2)}\n`)
+      await $.fs.write(`${r.raiz}/${LOCAL}`, `${JSON.stringify(loDelControl(conPendiente), null, 2)}\n`)
     }
   }
   return [linea, ...frases(r.salida, orden(r.estado), r.estado.declarado), ...resto(r.salida), ...r.salida.avisos, ...anotado, r.github === 'ok' ? '' : `GitHub: ${r.github}.`].filter(Boolean).join('\n')
@@ -1316,7 +1345,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     const c = await read($, control)
     if (!c.activo || !c.orden) return r
-    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: `Control de consumo (.claude/orquestacion.json).\n${c.orden}`, scope: 'session' as const }] }
+    return { ...r, sections: [...r.sections, { id: 'consumo:control', text: `Control de consumo (decide con .claude/orquestacion.json y escribe en .claude/orquestacion.local.json).\n${c.orden}`, scope: 'session' as const }] }
   })
 
   on('turn.complete', async ($, e, next) => {

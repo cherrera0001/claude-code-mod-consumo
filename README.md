@@ -143,23 +143,32 @@ Se pide al instalar y se cambia en `/plugin`:
 | `repo` | `dueño/nombre` del repositorio de issues | el remoto `origin` |
 | `cuentaGitHub` | Cuenta de `gh` con la que se consulta | la dueña del repositorio |
 
-## El fichero del control
+## Los dos ficheros del control
 
-`.claude/orquestacion.json`, en la raíz del repositorio de trabajo, es donde el control escribe y donde
-se le dice lo que `git` y GitHub no saben. Plantilla: [`ejemplos/orquestacion.json`](ejemplos/orquestacion.json).
+En la raíz del repositorio de trabajo hay dos ficheros, y sólo uno se versiona:
 
-| Clave | Quién la escribe | Qué es |
-|---|---|---|
-| `cola` | tú | El orden en que se toman las issues |
-| `fuera` | tú o `/consumo fuera` | Trabajador → motivo |
-| `declarado` | tú | Por issue: `clase`, `falta`, `solo_sesion`, las cinco respuestas del peso, y lo que arma la orden: `pasos` (lista ordenada, cada uno con `hecho`), `criterio`, `archivos` y `espera` |
-| `no_tocar` | tú | Archivos que un trabajador externo no puede tocar |
-| `asignaciones` | el control | Issue → trabajador, clase, peso, esfuerzo, estado y encargo |
-| `clasificacion` | el control | Todas las issues leídas, con su situación |
-| `router` | el control | Si GitHub respondió y qué anotaciones quedaron pendientes |
-| `produccion` | tú | `{ "salud": "<url de /health>" }`: de dónde sale la ficha pública de producción. Sin ella no hay ficha |
+| Fichero | Quién lo escribe | Se versiona | Qué lleva |
+|---|---|---|---|
+| `.claude/orquestacion.json` | tú | sí | `cola`, `fuera`, `declarado`, `no_tocar`, `produccion` |
+| `.claude/orquestacion.local.json` | el control | **no** | `asignaciones`, `clasificacion`, `router`, `reasignado` |
 
-El fichero sólo se reescribe cuando la decisión cambia.
+Añade a tu `.gitignore`: `.claude/orquestacion.local.json`. El control no toca el fichero versionado: un árbol
+sucio no se despliega, y una decisión que cambia en cada despertar no es historia del repositorio. La única
+excepción es una orden tuya, `/consumo fuera`, que declara en `fuera` quién no recibe nada.
+
+Lo que tú escribes, plantilla en [`ejemplos/orquestacion.json`](ejemplos/orquestacion.json):
+
+| Clave | Qué es |
+|---|---|
+| `cola` | El orden en que se toman las issues |
+| `fuera` | Trabajador → motivo |
+| `declarado` | Por issue: `clase`, `falta`, `solo_sesion`, las cinco respuestas del peso, y lo que arma la orden: `pasos` (lista ordenada, cada uno con `hecho`), `criterio`, `archivos` y `espera` |
+| `no_tocar` | Archivos que un trabajador externo no puede tocar |
+| `produccion` | `salud`: la URL de `/health` de la que sale la ficha pública |
+
+El fichero local sólo se reescribe cuando la decisión cambia. Si tu fichero versionado todavía trae
+`asignaciones` de una versión anterior, el control las respeta hasta que exista el local; después puedes
+borrarlas del versionado.
 
 ## El index
 

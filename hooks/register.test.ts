@@ -101,11 +101,13 @@ function repositorioDePrueba(
   issues: IssueDePrueba[],
   estado: Record<string, unknown>,
   extra: { medicion?: unknown; salud?: string } = {},
-): { escrito: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[] } {
+): { escrito: () => any; versionado: () => any; local: () => any; poner: (e: unknown) => void; entro: () => string; romper: () => void; archivos: () => Record<string, string>; pedidas: () => string[] } {
   const otros: Record<string, string> = {}
   const urls: string[] = []
   const contestar = on as unknown as (evento: string, hook: ($: unknown, e: { argv?: readonly string[]; path?: string; text?: string }) => unknown) => void
   let guardado = JSON.stringify(estado)
+  let delControl = ''
+  const esLocal = (ruta: unknown) => /orquestacion\.local\.json$/.test(String(ruta))
   let entrado = ''
   let roto = false
   const yo = on as unknown as (evento: string, hook: ($: unknown, e: { text: string }) => unknown) => void
@@ -121,11 +123,12 @@ function repositorioDePrueba(
   contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
   contestar('fs.exists', (_$, e) => {
     if (roto) throw new Error('disco caído')
-    return { value: /orquestacion\.json$/.test(String(e.path)) }
+    return { value: esLocal(e.path) ? delControl !== '' : /orquestacion\.json$/.test(String(e.path)) }
   })
-  contestar('fs.read', () => ({ value: guardado }))
+  contestar('fs.read', (_$, e) => ({ value: esLocal(e.path) ? delControl : guardado }))
   contestar('fs.write', (_$, e) => {
-    if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
+    if (esLocal(e.path)) delControl = String(e.text)
+    else if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
     // El motor entrega la ruta con las barras del sistema; aquí se guardan con barras normales.
     else otros[String(e.path).replace(/\\/g, '/')] = String(e.text)
     return { value: undefined }
@@ -145,7 +148,10 @@ function repositorioDePrueba(
   return {
     archivos: () => otros,
     pedidas: () => urls,
-    escrito: () => JSON.parse(guardado),
+    // Lo que el control decide con los dos ficheros: lo declarado más lo suyo.
+    escrito: () => ({ ...JSON.parse(guardado), ...(delControl ? JSON.parse(delControl) : {}) }),
+    versionado: () => JSON.parse(guardado),
+    local: () => (delControl ? JSON.parse(delControl) : null),
     poner: e => {
       guardado = JSON.stringify(e)
     },
@@ -491,10 +497,13 @@ function sinEnvoltorio(on: unknown, identidad: string): { escrito: () => any } {
   contestar('session.cwd', () => ({ value: 'F:/proyecto' }))
   contestar('session.root', () => ({ value: 'F:/proyecto' }))
   contestar('session.model', () => ({ value: 'claude-opus-5-5' }))
-  contestar('fs.exists', (_$, e) => ({ value: /orquestacion\.json$/.test(String(e.path)) }))
-  contestar('fs.read', () => ({ value: guardado }))
+  let delControl = ''
+  const esLocal = (ruta: unknown) => /orquestacion\.local\.json$/.test(String(ruta))
+  contestar('fs.exists', (_$, e) => ({ value: esLocal(e.path) ? delControl !== '' : /orquestacion\.json$/.test(String(e.path)) }))
+  contestar('fs.read', (_$, e) => ({ value: esLocal(e.path) ? delControl : guardado }))
   contestar('fs.write', (_$, e) => {
-    if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
+    if (esLocal(e.path)) delControl = String(e.text)
+    else if (/orquestacion\.json$/.test(String(e.path))) guardado = String(e.text)
     return { value: undefined }
   })
   contestar('process.run', (_$, e) => {
@@ -507,7 +516,7 @@ function sinEnvoltorio(on: unknown, identidad: string): { escrito: () => any } {
     if (argv[0] === 'gh' && argv.includes('list')) return bien(JSON.stringify([{ number: 346, title: 'Ajustar un formulario', labels: [], body: '', projectItems: [{}] }]))
     return { value: { exitCode: 1, stdout: '', stderr: 'sin procesos en la prueba' } }
   })
-  return { escrito: () => JSON.parse(guardado) }
+  return { escrito: () => ({ ...JSON.parse(guardado), ...(delControl ? JSON.parse(delControl) : {}) }) }
 }
 
 test('si el envoltorio del repositorio no responde, el control lee como la cuenta dueña y lo dice', async ($, on) => {
@@ -525,4 +534,34 @@ test('si esa credencial identifica a otra cuenta, no se usa: GitHub queda NO MED
   const respuesta = JSON.stringify(await $.command.run({ command: 'consumo', args: 'agentes' } as never))
   expect(respuesta).toContain('NO MEDIDO')
   expect(repo.escrito().router.issues_abiertas).toBe(null)
+})
+
+// ── El control no ensucia el repositorio ────────────────────────────────────────────────────────────
+test('el control escribe su decisión en el fichero local y deja intacto el versionado', async ($, on) => {
+  const declarado = { cola: [346], declarado: { '346': { falta: 'retirar un botón' } } }
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], declarado)
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(repo.versionado()).toEqual(declarado)
+  expect(repo.local().asignaciones['346'].trabajador).toBe('claude')
+  expect(repo.local().clasificacion.length).toBe(1)
+  expect(repo.local().cola).toBeUndefined()
+  expect(repo.local().declarado).toBeUndefined()
+})
+
+test('«/consumo fuera» sí escribe en el versionado, y sólo la clave fuera', async ($, on) => {
+  const declarado = { cola: [346], declarado: { '346': { falta: 'retirar un botón' } } }
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario')], declarado)
+  await $.command.run({ command: 'consumo', args: 'fuera codex sin cuota' } as never)
+  expect(Object.keys(repo.versionado()).sort()).toEqual(['cola', 'declarado', 'fuera'])
+  expect(repo.versionado().fuera.codex).toContain('sin cuota')
+  expect(repo.versionado().asignaciones).toBeUndefined()
+})
+
+test('un fichero versionado que aún trae la decisión de antes se respeta hasta que exista el local', async ($, on) => {
+  const antiguo = { cola: [346, 347], asignaciones: { '347': { trabajador: 'claude', clase: 'Construcción', puntos: 0, peso: 'XS', esfuerzo: 'bajo', estado: 'vigente', desde: '2026-05-28T00:00:00.000Z', motivo: 'de antes' } } }
+  const repo = repositorioDePrueba(on, [issue(346, 'Ajustar un formulario'), issue(347, 'Otro ajuste')], antiguo)
+  await $.command.run({ command: 'consumo', args: 'agentes' } as never)
+  expect(repo.local().asignaciones['347'].trabajador).toBe('claude')
+  expect(repo.local().asignaciones['346']).toBeUndefined()
+  expect(repo.versionado()).toEqual(antiguo)
 })
